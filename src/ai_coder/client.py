@@ -57,11 +57,23 @@ def call_nonstream(
     model: str,
     tools: list[dict] | None = None,
 ) -> Any:
-    """Non-streaming chat — returns the full ChatResponse. Used by the agent loop."""
+    """Non-streaming chat — returns the full ChatResponse. Used by the agent loop.
+
+    If the model returns a 500 error (malformed tool-call XML, a known Ollama
+    bug with some smaller models), automatically retries without tools so the
+    conversation continues with a plain-text response.
+    """
     kwargs: dict = {"model": model, "messages": messages}
     if tools:
         kwargs["tools"] = tools
-    return ollama.chat(**kwargs)
+    try:
+        return ollama.chat(**kwargs)
+    except ollama.ResponseError as e:
+        if e.status_code == 500 and tools:
+            # Malformed tool-call XML from model → fall back to plain chat
+            kwargs.pop("tools", None)
+            return ollama.chat(**kwargs)
+        raise
 
 
 def stream_agent_iter(
