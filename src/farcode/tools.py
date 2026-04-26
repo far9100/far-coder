@@ -23,11 +23,23 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the full contents of a file at the given path.",
+            "description": (
+                "Read a file's contents. By default returns the whole file (capped at "
+                "~50 KB). Use offset and limit (1-based line numbers) to read a specific "
+                "slice of a large file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based line number to start reading from",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of lines to return",
+                    },
                 },
                 "required": ["path"],
             },
@@ -165,8 +177,9 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "recall_memory",
             "description": (
-                "Search past session memories by keyword. "
-                "Returns up to 5 matching summaries from previous coding sessions."
+                "Search past session memories by keyword (FTS5-ranked). "
+                "Returns up to 5 matching summaries. Default scope is 'project' "
+                "(only the current repo); pass scope='all' to search globally."
             ),
             "parameters": {
                 "type": "object",
@@ -175,8 +188,42 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": "Keywords to search for in past session summaries",
                     },
+                    "scope": {
+                        "type": "string",
+                        "description": "'project' (default) or 'all'",
+                    },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Record a one-sentence lesson from the current session so it survives "
+                "into future sessions. Use after completing a non-trivial sub-goal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "One- or two-sentence distilled lesson or decision",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of short tag strings",
+                    },
+                    "files_touched": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of file paths that this lesson relates to",
+                    },
+                },
+                "required": ["summary"],
             },
         },
     },
@@ -193,28 +240,39 @@ def execute_tool(name: str, arguments: dict) -> str:
         "search_in_files": _search_in_files,
         "create_file": _create_file,
         "recall_memory": _recall_memory,
+        "save_memory": _save_memory,
     }
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
     try:
-        return handler(**{k: v for k, v in arguments.items() if k != "timeout" or name == "run_bash"})
+        return handler(**arguments)
     except TypeError as e:
         return f"Tool call error (bad arguments): {e}"
     except Exception as e:
         return f"Tool error: {e}"
 
 
-def _read_file(path: str) -> str:
+def _read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
     p = Path(path)
     if not p.exists():
         return f"Error: File not found: {path}"
     if not p.is_file():
         return f"Error: Not a file: {path}"
     try:
-        return _truncate_output(p.read_text(encoding="utf-8", errors="replace"))
+        text = p.read_text(encoding="utf-8", errors="replace")
     except PermissionError:
         return f"Error: Permission denied: {path}"
+
+    if offset is not None or limit is not None:
+        lines = text.splitlines(keepends=True)
+        start = max(0, (offset or 1) - 1)
+        end = start + limit if limit and limit > 0 else len(lines)
+        end = min(end, len(lines))
+        sliced = "".join(lines[start:end])
+        prefix = f"[lines {start + 1}-{end} of {len(lines)}]\n" if lines else ""
+        return _truncate_output(prefix + sliced, cap=_MAX_FILE_READ_CHARS)
+    return _truncate_output(text, cap=_MAX_FILE_READ_CHARS)
 
 
 def _write_file(path: str, content: str) -> str:
@@ -324,12 +382,13 @@ def _list_directory(path: str, depth: int = 2) -> str:
 
 _SEARCH_CAP = 200
 _MAX_OUTPUT_CHARS = 3000
+_MAX_FILE_READ_CHARS = 50_000
 
 
-def _truncate_output(text: str) -> str:
-    if len(text) <= _MAX_OUTPUT_CHARS:
+def _truncate_output(text: str, cap: int = _MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= cap:
         return text
-    return text[:_MAX_OUTPUT_CHARS] + f"\n... [truncated — {len(text)} chars total, showing first {_MAX_OUTPUT_CHARS}]"
+    return text[:cap] + f"\n... [truncated — {len(text)} chars total, showing first {cap}]"
 
 
 def _search_in_files(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
@@ -380,15 +439,47 @@ def _create_file(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-def _recall_memory(query: str) -> str:
+def _recall_memory(query: str, scope: str = "project") -> str:
     try:
-        from .memory import search
-        results = search(query)
+        from .memory import current_project_path, search
+        project = current_project_path() if scope != "all" else None
+        results = search(query, top_k=5, project_path=project, scope=scope)
     except Exception as e:
         return f"Memory search error: {e}"
     if not results:
         return "No matching memories found."
     lines = [f"Found {len(results)} matching memory/memories:\n"]
     for entry in results:
-        lines.append(f"[{entry.get('created_at', '')[:10]}]\n{entry.get('summary', '')}\n")
+        date = (entry.get("created_at", "") or "")[:10]
+        kind = entry.get("kind", "")
+        proj = entry.get("project_path", "") or ""
+        proj_short = Path(proj).name if proj else ""
+        header = f"[{date}]"
+        if kind:
+            header += f" [{kind}]"
+        if proj_short:
+            header += f" ({proj_short})"
+        lines.append(f"{header}\n{entry.get('summary', '')}\n")
     return "\n".join(lines)
+
+
+def _save_memory(
+    summary: str,
+    tags: list[str] | None = None,
+    files_touched: list[str] | None = None,
+) -> str:
+    if not summary or not summary.strip():
+        return "Error: summary is required"
+    try:
+        from .memory import append_entry, current_project_path
+        append_entry(
+            session_id="tool_call",
+            summary=summary.strip(),
+            kind="task",
+            tags=tags,
+            files_touched=files_touched,
+            project_path=current_project_path(),
+        )
+        return "OK: memory saved"
+    except Exception as e:
+        return f"Error saving memory: {e}"

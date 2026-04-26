@@ -15,11 +15,11 @@ from .client import (
     DEFAULT_NUM_CTX,
     DEFAULT_NUM_PREDICT,
     StreamStats,
-    _system_prompt,
     build_system_messages,
     call_nonstream,
     check_ollama,
 )
+from .coder_md import find_coder_md_files, load_coder_md
 from .memory import append_entry, current_project_path
 from .sessions import Session, load_sessions, new_session, save_session
 from .tools import TOOL_SCHEMAS, execute_tool
@@ -209,11 +209,18 @@ def _make_prompt_session() -> PromptSession:
 # ── Session helpers ───────────────────────────────────────────────────────────
 
 def _restore_session(session: Session, messages: list[dict], num_ctx: int) -> None:
-    """Load session messages into the active list, refreshing the system prompt."""
+    """Load session messages into the active list, refreshing the system prompt.
+
+    Rebuilds via build_system_messages() so any changes to CODER.md or stored
+    memory since the session was saved are picked up on resume.
+    """
     messages.clear()
     messages.extend(session.messages)
+    fresh_system = build_system_messages(num_ctx=num_ctx)[0]
     if messages and messages[0].get("role") == "system":
-        messages[0] = {"role": "system", "content": _system_prompt(num_ctx)}
+        messages[0] = fresh_system
+    else:
+        messages.insert(0, fresh_system)
 
 
 def _extract_files_touched(messages: list[dict]) -> list[str]:
@@ -485,6 +492,13 @@ def run_chat(
 
     print_welcome(current_model)
 
+    for rules_path in find_coder_md_files():
+        try:
+            size = rules_path.stat().st_size
+            print_info(f"Loaded rules: {rules_path} ({size} B)")
+        except OSError:
+            pass
+
     if resume_session is not None:
         print_info(
             f"Resumed: [bold]{resume_session.title}[/]  "
@@ -599,6 +613,19 @@ def run_chat(
                 f"Compacted: {before_n} → {len(messages)} msgs, "
                 f"{before_tok} → {after_tok} tokens (est.)"
             )
+            continue
+
+        if cmd == "/rules":
+            paths = find_coder_md_files()
+            if not paths:
+                print_info("No CODER.md found. Drop one in your project root or at ~/.coder.md.")
+            else:
+                rules = load_coder_md()
+                for p in paths:
+                    print_info(f"  · {p}")
+                console.print()
+                console.print(rules)
+                console.print()
             continue
 
         if cmd == "/resume":
