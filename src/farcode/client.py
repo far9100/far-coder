@@ -88,9 +88,12 @@ def call_nonstream(
 ) -> Any:
     """Non-streaming chat — returns the full ChatResponse. Used by the agent loop.
 
-    If the model returns a 500 error (malformed tool-call XML, a known Ollama
-    bug with some smaller models), automatically retries without tools so the
-    conversation continues with a plain-text response.
+    Recovery ladder when the native tool-calling path 500s (a known Ollama bug
+    with some smaller models that emit malformed tool XML/JSON):
+      1. Retry once with ``format=<json_schema>`` constraining output to a
+         single ``{name, arguments}`` payload. The grammar makes valid output
+         the *only* possibility, which 4B models handle far more reliably.
+      2. If that also 500s, fall back to plain-text chat with no tools.
     """
     kwargs: dict = {
         "model": model,
@@ -102,10 +105,143 @@ def call_nonstream(
     try:
         return ollama.chat(**kwargs)
     except ollama.ResponseError as e:
-        if e.status_code == 500 and tools:
-            kwargs.pop("tools", None)
-            return ollama.chat(**kwargs)
-        raise
+        if e.status_code != 500 or not tools:
+            raise
+
+        retry = _grammar_constrained_tool_call(
+            messages, model, tools, num_ctx, num_predict
+        )
+        if retry is not None:
+            return retry
+
+        kwargs.pop("tools", None)
+        return ollama.chat(**kwargs)
+
+
+# ── Grammar-constrained tool-call retry ───────────────────────────────────────
+
+class _SyntheticFunction:
+    def __init__(self, name: str, arguments: dict) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _SyntheticToolCall:
+    def __init__(self, name: str, arguments: dict) -> None:
+        self.function = _SyntheticFunction(name, arguments)
+
+
+class _SyntheticMessage:
+    def __init__(self, content: str, tool_calls: list) -> None:
+        self.content = content
+        self.tool_calls = tool_calls
+        self.thinking = None
+
+
+class _SyntheticResponse:
+    """Mimics ``ollama.ChatResponse`` enough for the agent loop's needs."""
+
+    def __init__(
+        self,
+        content: str,
+        tool_calls: list,
+        eval_count: int = 0,
+        prompt_eval_count: int = 0,
+    ) -> None:
+        self.message = _SyntheticMessage(content, tool_calls)
+        self.eval_count = eval_count
+        self.prompt_eval_count = prompt_eval_count
+        self.done = True
+
+
+def _tool_names(tools: list[dict]) -> list[str]:
+    return [t.get("function", {}).get("name") for t in tools if t.get("function")]
+
+
+def _grammar_schema(tools: list[dict]) -> dict:
+    """JSON schema constraining the model to one of:
+       - {"tool_call": {"name": <enum>, "arguments": <object>}}
+       - {"answer": <string>}
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "tool_call": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": _tool_names(tools)},
+                    "arguments": {"type": "object"},
+                },
+                "required": ["name", "arguments"],
+            },
+            "answer": {"type": "string"},
+        },
+    }
+
+
+def _grammar_prompt_suffix(tools: list[dict]) -> str:
+    names = ", ".join(_tool_names(tools))
+    return (
+        "\n\n[The previous response was malformed. Reply with ONLY a JSON object "
+        f'matching this shape: either {{"tool_call": {{"name": "<one of: {names}>", '
+        '"arguments": {...}}} to call a tool, or {"answer": "..."} to give a '
+        "final reply. No prose, no markdown.]"
+    )
+
+
+def _grammar_constrained_tool_call(
+    messages: list[dict],
+    model: str,
+    tools: list[dict],
+    num_ctx: int,
+    num_predict: int,
+) -> Any:
+    """Retry the failed call with a JSON-schema constraint. Returns a
+    ``_SyntheticResponse`` on success or ``None`` if the retry also failed."""
+    import json as _json
+
+    nudge = list(messages)
+    if nudge and nudge[-1].get("role") != "system":
+        nudge = nudge + [
+            {"role": "user", "content": _grammar_prompt_suffix(tools).strip()}
+        ]
+    try:
+        response = ollama.chat(
+            model=model,
+            messages=nudge,
+            options=_ollama_options(num_ctx, num_predict),
+            format=_grammar_schema(tools),
+        )
+    except Exception:
+        return None
+
+    content = (response.message.content or "").strip()
+    if not content:
+        return None
+    try:
+        parsed = _json.loads(content)
+    except _json.JSONDecodeError:
+        return None
+
+    if isinstance(parsed, dict) and "tool_call" in parsed:
+        tc = parsed["tool_call"] or {}
+        name = tc.get("name")
+        args = tc.get("arguments") or {}
+        if name in _tool_names(tools) and isinstance(args, dict):
+            return _SyntheticResponse(
+                content="",
+                tool_calls=[_SyntheticToolCall(name, args)],
+                eval_count=getattr(response, "eval_count", 0) or 0,
+                prompt_eval_count=getattr(response, "prompt_eval_count", 0) or 0,
+            )
+    if isinstance(parsed, dict) and "answer" in parsed:
+        return _SyntheticResponse(
+            content=str(parsed.get("answer", "")),
+            tool_calls=[],
+            eval_count=getattr(response, "eval_count", 0) or 0,
+            prompt_eval_count=getattr(response, "prompt_eval_count", 0) or 0,
+        )
+    return None
 
 
 def stream_agent_iter(
@@ -160,10 +296,14 @@ def build_system_messages(
     first_user_message: str | None = None,
     num_ctx: int = DEFAULT_NUM_CTX,
 ) -> list[dict]:
-    """Build the system message, with project-scoped memory injected.
+    """Build the system message, with project context injected.
 
-    If `first_user_message` is provided, runs an FTS5 search against memory
-    using its terms; otherwise falls back to the most recent project memories.
+    Order (later items appear later in the prompt, where the model attends most):
+      1. Base system prompt
+      2. CODER.md project rules
+      3. Codebase facts (language, package manager, test runner, entry points)
+      4. Repo map (top-level definitions, ranked & token-budgeted)
+      5. Past Work memory (FTS-matched on first user message, else recent)
     """
     parts: list[str] = [_system_prompt(num_ctx)]
 
@@ -172,6 +312,22 @@ def build_system_messages(
         rules = load_coder_md()
         if rules:
             parts.append(rules)
+    except Exception:
+        pass
+
+    try:
+        from .facts import get_or_build_facts
+        facts = get_or_build_facts()
+        if facts:
+            parts.append(facts)
+    except Exception:
+        pass
+
+    try:
+        from .repomap import build_repo_map
+        repo = build_repo_map()
+        if repo:
+            parts.append(repo)
     except Exception:
         pass
 
