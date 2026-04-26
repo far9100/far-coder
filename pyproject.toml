@@ -1,0 +1,22 @@
+[project]
+name = "ai-coder"
+version = "0.1.0"
+description = "AI coding assistant CLI powered by Ollama"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ollama>=0.6.1",
+    "prompt-toolkit>=3.0.52",
+    "rich>=15.0.0",
+    "typer>=0.24.2",
+]
+
+[project.scripts]
+ai-coder = "ai_coder.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_coder"]
