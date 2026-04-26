@@ -1,3 +1,4 @@
+import math
 import queue as _queue
 import re
 import threading
@@ -10,7 +11,16 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from .client import SYSTEM_PROMPT, StreamStats, build_system_messages, call_nonstream, check_ollama
+from .client import (
+    DEFAULT_NUM_CTX,
+    DEFAULT_NUM_PREDICT,
+    StreamStats,
+    _system_prompt,
+    build_system_messages,
+    call_nonstream,
+    check_ollama,
+)
+from .memory import append_entry, current_project_path
 from .sessions import Session, load_sessions, new_session, save_session
 from .tools import TOOL_SCHEMAS, execute_tool
 from .ui import (
@@ -24,8 +34,155 @@ from .ui import (
 )
 
 _PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
-_HISTORY_FILE = Path.home() / ".ai_coder_history"
+_HISTORY_FILE = Path.home() / ".farcode_history"
 DEFAULT_MODEL = "qwen3.5:4b"
+
+_CHARS_PER_TOKEN = 3.5
+_HEADROOM_FRAC = 0.10
+_AUTO_COMPACT_THRESHOLD = 0.80
+
+
+# ── Token accounting ─────────────────────────────────────────────────────────
+
+def _est_tokens(msg: dict) -> int:
+    """Heuristic token estimate for a single message. ~3.5 chars/token + overhead."""
+    content = msg.get("content") or ""
+    extra = msg.get("tool_calls")
+    text = str(content) + (str(extra) if extra else "")
+    return int(math.ceil(len(text) / _CHARS_PER_TOKEN)) + 4
+
+
+def _total_tokens(msgs: list[dict]) -> int:
+    return sum(_est_tokens(m) for m in msgs)
+
+
+def _input_budget(num_ctx: int, num_predict: int) -> int:
+    return max(1024, int((num_ctx - num_predict) * (1 - _HEADROOM_FRAC)))
+
+
+def _trim_messages(messages: list[dict], num_ctx: int, num_predict: int) -> list[dict]:
+    """Drop oldest user→assistant turn pairs when over budget. Never split a
+    `tool_calls` → `tool` reply pair. The original list is never mutated.
+    """
+    budget = _input_budget(num_ctx, num_predict)
+    if _total_tokens(messages) <= budget:
+        return messages
+
+    system = messages[:1]
+    rest = list(messages[1:])
+
+    while _total_tokens(system + rest) > budget and len(rest) >= 2:
+        drop_end = 1
+        for i in range(1, len(rest)):
+            if rest[i].get("role") == "user":
+                drop_end = i
+                break
+        else:
+            drop_end = max(1, len(rest) - 2)
+        rest = rest[drop_end:]
+
+    return system + rest
+
+
+# ── Auto-compaction ──────────────────────────────────────────────────────────
+
+def _summarize_turns(turns: list[dict], model: str, num_ctx: int) -> str:
+    """Summarize a slice of turns into a few bullets. Returns "" on failure."""
+    lines: list[str] = []
+    for m in turns:
+        role = m.get("role")
+        if role in ("user", "assistant") and m.get("content"):
+            lines.append(f"{role.upper()}: {str(m['content'])[:400]}")
+        elif role == "tool" and m.get("content"):
+            lines.append(f"TOOL: {str(m['content'])[:200]}")
+    if not lines:
+        return ""
+    conv = "\n".join(lines)
+    if len(conv) > 6000:
+        conv = conv[:6000] + "\n...[truncated]"
+    summarize_msgs = [
+        {
+            "role": "system",
+            "content": (
+                "You are a concise summarizer. "
+                "Reply with ONLY 3-6 bullet points (each starting with '- ') "
+                "describing what the user asked, what was decided, and what files were touched. "
+                "No intro, no headers."
+            ),
+        },
+        {"role": "user", "content": f"Summarize these conversation turns:\n\n{conv}"},
+    ]
+    try:
+        response = call_nonstream(
+            summarize_msgs, model, tools=None, num_ctx=num_ctx, num_predict=512
+        )
+        return (response.message.content or "").strip()
+    except Exception:
+        return ""
+
+
+def _snap_past_tool_replies(messages: list[dict], idx: int) -> int:
+    """Move idx forward past role='tool' entries to keep tool_calls/tool pairs intact."""
+    while idx < len(messages) and messages[idx].get("role") == "tool":
+        idx += 1
+    return idx
+
+
+def _auto_compact(
+    messages: list[dict],
+    model: str,
+    num_ctx: int,
+    num_predict: int,
+    *,
+    force: bool = False,
+) -> list[dict]:
+    """Summarize older turns when usage is high (or always, when force=True).
+
+    Keeps system + last 4 user→assistant pairs verbatim; replaces the middle
+    span with a synthetic user/assistant pair carrying the bullet summary.
+    """
+    budget = _input_budget(num_ctx, num_predict)
+    if not force and _total_tokens(messages) < budget * _AUTO_COMPACT_THRESHOLD:
+        return messages
+    if len(messages) < 6:
+        return messages
+
+    system = messages[:1]
+    rest = messages[1:]
+
+    user_indices = [i for i, m in enumerate(rest) if m.get("role") == "user"]
+    keep_pairs = 4
+    if len(user_indices) <= keep_pairs:
+        return messages
+
+    cutoff = user_indices[-keep_pairs]
+    cutoff = _snap_past_tool_replies(rest, cutoff)
+    if cutoff <= 0 or cutoff >= len(rest):
+        return messages
+
+    older = rest[:cutoff]
+    newer = rest[cutoff:]
+
+    print_info("Auto-compacting earlier turns...")
+    summary = _summarize_turns(older, model, num_ctx)
+    if not summary:
+        return messages
+
+    try:
+        append_entry(
+            session_id="auto_compact",
+            summary=summary,
+            kind="task",
+            project_path=current_project_path(),
+        )
+    except Exception:
+        pass
+
+    synthetic = [
+        {"role": "user", "content": f"[Summary of earlier turns]\n{summary}"},
+        {"role": "assistant", "content": "Acknowledged."},
+    ]
+    return system + synthetic + newer
 
 
 # ── Input session ─────────────────────────────────────────────────────────────
@@ -51,13 +208,74 @@ def _make_prompt_session() -> PromptSession:
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
-def _restore_session(session: Session, messages: list[dict]) -> None:
-    """Load session messages into the active list, always refreshing the system prompt."""
+def _restore_session(session: Session, messages: list[dict], num_ctx: int) -> None:
+    """Load session messages into the active list, refreshing the system prompt."""
     messages.clear()
     messages.extend(session.messages)
-    # Keep the system prompt current even if it changed since the session was saved
     if messages and messages[0].get("role") == "system":
-        messages[0] = {"role": "system", "content": SYSTEM_PROMPT}
+        messages[0] = {"role": "system", "content": _system_prompt(num_ctx)}
+
+
+def _extract_files_touched(messages: list[dict]) -> list[str]:
+    """Pull file paths out of tool_calls (read_file/edit_file/write_file/create_file)."""
+    found: dict[str, None] = {}
+    file_tools = {"read_file", "edit_file", "write_file", "create_file"}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            try:
+                fn = tc.get("function") or {}
+                if fn.get("name") in file_tools:
+                    args = fn.get("arguments") or {}
+                    path = args.get("path")
+                    if isinstance(path, str) and path:
+                        found.setdefault(path, None)
+            except (AttributeError, TypeError):
+                continue
+    return list(found)
+
+
+def _summarize_session(session: Session, model: str, num_ctx: int) -> None:
+    try:
+        real_turns = sum(
+            1 for m in session.messages
+            if m.get("role") == "user"
+            and not str(m.get("content", "")).startswith("File `")
+        )
+        if real_turns == 0:
+            return
+        print_info("Summarizing session...")
+        lines = []
+        for m in session.messages:
+            if m.get("role") in ("user", "assistant") and m.get("content"):
+                lines.append(f"{m['role'].upper()}: {str(m['content'])[:400]}")
+        conv = "\n".join(lines)
+        if len(conv) > 6000:
+            conv = conv[:6000] + "\n...[truncated]"
+        summarize_msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise summarizer. "
+                    "Reply with ONLY 2-4 bullet points (each starting with '- ') "
+                    "describing what was accomplished. No intro, no headers."
+                ),
+            },
+            {"role": "user", "content": f"Summarize this coding session:\n\n{conv}"},
+        ]
+        response = call_nonstream(
+            summarize_msgs, model, tools=None, num_ctx=num_ctx, num_predict=512
+        )
+        summary = (response.message.content or "").strip()
+        if summary:
+            append_entry(
+                session_id=session.id,
+                summary=summary,
+                kind="session_summary",
+                project_path=current_project_path(),
+                files_touched=_extract_files_touched(session.messages),
+            )
+    except Exception:
+        pass
 
 
 def _pick_session() -> Session | None:
@@ -169,20 +387,34 @@ def _run_tools_parallel(tool_calls: list) -> list[tuple[str, dict, str]]:
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
-def _run_agent_turn(messages: list[dict], model: str) -> None:
-    """
-    Execute one user turn as a full agentic loop.
+def _run_agent_turn(
+    messages: list[dict],
+    model: str,
+    num_ctx: int,
+    num_predict: int,
+) -> None:
+    """Execute one user turn as a full agentic loop.
 
-    Uses non-streaming calls so that tool_calls are always reliably populated
-    (Ollama's streaming API does not guarantee tool_calls in the final chunk).
-    A spinner is shown while the model generates each response.
+    Auto-compacts older turns when usage exceeds the threshold; falls back to
+    hard trimming if compaction can't free enough space.
     """
     while True:
+        compacted = _auto_compact(messages, model, num_ctx, num_predict)
+        if compacted is not messages:
+            messages.clear()
+            messages.extend(compacted)
+
         stats = StreamStats()
+        stats.ctx_size = num_ctx
 
         try:
+            trimmed = _trim_messages(messages, num_ctx, num_predict)
+            stats.input_tokens = _total_tokens(trimmed)
             response = call_with_thinking(
-                lambda: call_nonstream(messages, model, tools=TOOL_SCHEMAS),
+                lambda: call_nonstream(
+                    trimmed, model, tools=TOOL_SCHEMAS,
+                    num_ctx=num_ctx, num_predict=num_predict,
+                ),
                 stats,
             )
         except KeyboardInterrupt:
@@ -194,6 +426,9 @@ def _run_agent_turn(messages: list[dict], model: str) -> None:
 
         if hasattr(response, "eval_count") and response.eval_count:
             stats.token_count = response.eval_count
+        prompt_eval = getattr(response, "prompt_eval_count", None)
+        if prompt_eval:
+            stats.input_tokens = prompt_eval
 
         content = response.message.content or ""
         tool_calls = list(response.message.tool_calls or [])
@@ -229,16 +464,24 @@ def run_chat(
     file: str | None = None,
     resume_session: Session | None = None,
     background: bool = False,
+    num_ctx: int = DEFAULT_NUM_CTX,
+    num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> None:
-    check_ollama(model)
+    check_ollama(model, num_ctx=num_ctx)
     current_model = model
     current_session: Session | None = None
-    messages = build_system_messages()
+    messages = build_system_messages(num_ctx=num_ctx)
+    first_user_seen = False
 
     if resume_session is not None:
-        _restore_session(resume_session, messages)
+        _restore_session(resume_session, messages, num_ctx)
         current_model = resume_session.model
         current_session = resume_session
+        first_user_seen = True
+        compacted = _auto_compact(messages, current_model, num_ctx, num_predict)
+        if compacted is not messages:
+            messages.clear()
+            messages.extend(compacted)
 
     print_welcome(current_model)
 
@@ -268,7 +511,7 @@ def run_chat(
                 return
             expanded, model_snap = item
             messages.append({"role": "user", "content": expanded})
-            _run_agent_turn(messages, model_snap)
+            _run_agent_turn(messages, model_snap, num_ctx, num_predict)
             if current_session is None:
                 current_session = new_session(model_snap)
             current_session.messages = list(messages)
@@ -284,7 +527,7 @@ def run_chat(
             _work_q.put((expanded, model))
         else:
             messages.append({"role": "user", "content": expanded})
-            _run_agent_turn(messages, model)
+            _run_agent_turn(messages, model, num_ctx, num_predict)
 
     def _wait_idle() -> None:
         _work_q.join()
@@ -311,14 +554,18 @@ def run_chat(
 
         if cmd in ("/exit", "/quit"):
             _wait_idle()
+            if current_session is not None:
+                _summarize_session(current_session, current_model, num_ctx)
             break
 
         if cmd == "/clear":
             _wait_idle()
             if current_session is not None:
+                _summarize_session(current_session, current_model, num_ctx)
                 save_session(current_session)
-            messages = build_system_messages()
+            messages = build_system_messages(num_ctx=num_ctx)
             current_session = None
+            first_user_seen = False
             print_info("Conversation cleared. Starting new session.")
             continue
 
@@ -338,6 +585,22 @@ def run_chat(
                 print_info(f"Current model: [bold yellow]{current_model}[/]")
             continue
 
+        if cmd == "/compact":
+            _wait_idle()
+            before_n = len(messages)
+            before_tok = _total_tokens(messages)
+            compacted = _auto_compact(
+                messages, current_model, num_ctx, num_predict, force=True
+            )
+            messages.clear()
+            messages.extend(compacted)
+            after_tok = _total_tokens(messages)
+            print_info(
+                f"Compacted: {before_n} → {len(messages)} msgs, "
+                f"{before_tok} → {after_tok} tokens (est.)"
+            )
+            continue
+
         if cmd == "/resume":
             _wait_idle()
             chosen = _pick_session()
@@ -345,9 +608,16 @@ def run_chat(
                 if current_session is not None:
                     current_session.messages = list(messages)
                     save_session(current_session)
-                _restore_session(chosen, messages)
+                _restore_session(chosen, messages, num_ctx)
                 current_model = chosen.model
                 current_session = chosen
+                first_user_seen = True
+                compacted = _auto_compact(
+                    messages, current_model, num_ctx, num_predict
+                )
+                if compacted is not messages:
+                    messages.clear()
+                    messages.extend(compacted)
                 print_info(
                     f"Resumed: [bold]{chosen.title}[/]  "
                     f"[dim]{chosen.turn_count} turns · {chosen.updated_at[:10]}[/]"
@@ -359,6 +629,19 @@ def run_chat(
         expanded, found = _expand_at_mentions(user_input)
         if found:
             print_info(f"Attached: {', '.join(found)}")
+
+        # On the first real user message, swap in a query-aware system prompt
+        # so memory recall surfaces project-relevant past work.
+        if not first_user_seen and not user_input.startswith("/"):
+            try:
+                new_system = build_system_messages(
+                    first_user_message=user_input, num_ctx=num_ctx
+                )
+                if new_system and messages and messages[0].get("role") == "system":
+                    messages[0] = new_system[0]
+            except Exception:
+                pass
+            first_user_seen = True
 
         _dispatch(expanded, current_model)
 

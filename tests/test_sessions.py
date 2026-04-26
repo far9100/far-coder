@@ -1,7 +1,7 @@
 import pytest
 
-import ai_coder.sessions as sessions_mod
-from ai_coder.sessions import (
+import farcode.sessions as sessions_mod
+from farcode.sessions import (
     delete_session,
     load_last_session,
     load_sessions,

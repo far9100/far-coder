@@ -1,7 +1,7 @@
 """
 Conversation session persistence.
 
-Sessions are stored as JSON files in ~/.ai_coder_sessions/.
+Sessions are stored as JSON files in ~/.farcode_sessions/.
 Each file is named <YYYYMMDD_HHMMSS_xxxxxx>.json and contains the full
 message history along with metadata (title, model, timestamps).
 """
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-SESSIONS_DIR = Path.home() / ".ai_coder_sessions"
+SESSIONS_DIR = Path.home() / ".farcode_sessions"
 
 
 @dataclass

@@ -62,10 +62,28 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "write_file",
+            "description": (
+                "Write content to a file, creating it if it does not exist or overwriting it if it does. "
+                "Use this whenever you need to create or fully replace a file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_bash",
             "description": (
-                "Run a shell command and return stdout + stderr. "
-                "Use for running tests, building, grepping, or any shell task."
+                "Run a PowerShell command on Windows and return stdout + stderr. "
+                "Use PowerShell syntax: chain with `;` not `&&`, use `Remove-Item -Recurse -Force` not `rm -rf`."
             ),
             "parameters": {
                 "type": "object",
@@ -142,17 +160,39 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": (
+                "Search past session memories by keyword. "
+                "Returns up to 5 matching summaries from previous coding sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for in past session summaries",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
 def execute_tool(name: str, arguments: dict) -> str:
     handlers = {
         "read_file": _read_file,
+        "write_file": _write_file,
         "edit_file": _edit_file,
         "run_bash": _run_bash,
         "list_directory": _list_directory,
         "search_in_files": _search_in_files,
         "create_file": _create_file,
+        "recall_memory": _recall_memory,
     }
     handler = handlers.get(name)
     if not handler:
@@ -172,9 +212,22 @@ def _read_file(path: str) -> str:
     if not p.is_file():
         return f"Error: Not a file: {path}"
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        return _truncate_output(p.read_text(encoding="utf-8", errors="replace"))
     except PermissionError:
         return f"Error: Permission denied: {path}"
+
+
+def _write_file(path: str, content: str) -> str:
+    p = Path(path)
+    action = "overwritten" if p.exists() else "created"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"OK: {action} {path}"
+    except PermissionError:
+        return f"Error: Permission denied: {path}"
+    except OSError as e:
+        return f"Error: {e}"
 
 
 def _edit_file(path: str, old_str: str, new_str: str) -> str:
@@ -237,7 +290,7 @@ def _run_bash(command: str, timeout: int = 30) -> str:
     output = "\n".join(parts) if parts else "(no output)"
     if result.returncode != 0:
         output = f"[exit {result.returncode}]\n{output}"
-    return output
+    return _truncate_output(output)
 
 
 def _list_directory(path: str, depth: int = 2) -> str:
@@ -270,6 +323,13 @@ def _list_directory(path: str, depth: int = 2) -> str:
 
 
 _SEARCH_CAP = 200
+_MAX_OUTPUT_CHARS = 3000
+
+
+def _truncate_output(text: str) -> str:
+    if len(text) <= _MAX_OUTPUT_CHARS:
+        return text
+    return text[:_MAX_OUTPUT_CHARS] + f"\n... [truncated — {len(text)} chars total, showing first {_MAX_OUTPUT_CHARS}]"
 
 
 def _search_in_files(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
@@ -302,7 +362,8 @@ def _search_in_files(pattern: str, path: str = ".", file_pattern: str = "*") -> 
     if not results:
         return "No matches found."
     out = "\n".join(results)
-    return out + f"\n\n[capped at {_SEARCH_CAP} results]" if capped else out
+    out = out + f"\n\n[capped at {_SEARCH_CAP} results]" if capped else out
+    return _truncate_output(out)
 
 
 def _create_file(path: str, content: str) -> str:
@@ -317,3 +378,17 @@ def _create_file(path: str, content: str) -> str:
         return f"Error: Permission denied: {path}"
     except OSError as e:
         return f"Error: {e}"
+
+
+def _recall_memory(query: str) -> str:
+    try:
+        from .memory import search
+        results = search(query)
+    except Exception as e:
+        return f"Memory search error: {e}"
+    if not results:
+        return "No matching memories found."
+    lines = [f"Found {len(results)} matching memory/memories:\n"]
+    for entry in results:
+        lines.append(f"[{entry.get('created_at', '')[:10]}]\n{entry.get('summary', '')}\n")
+    return "\n".join(lines)

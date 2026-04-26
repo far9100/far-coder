@@ -1,6 +1,6 @@
 from typer.testing import CliRunner
 
-from ai_coder.cli import app
+from farcode.cli import app
 
 runner = CliRunner()
 

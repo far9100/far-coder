@@ -1,6 +1,6 @@
-# ai-coder
+# farcode
 
-An AI coding assistant CLI that runs entirely locally via [Ollama](https://ollama.com). Chat with a local LLM, attach files, and let the AI read, edit, search, and create files in your project through an agentic tool loop.
+A local AI coding assistant CLI that runs entirely on your machine via [Ollama](https://ollama.com). Chat with a local LLM, attach files, and let the AI read, edit, search, and create files in your project through an agentic tool loop.
 
 ## Requirements
 
@@ -19,20 +19,20 @@ uv pip install -e .
 ### `ask` — Single-turn question
 
 ```bash
-ai-coder ask "What is a context manager?"
-ai-coder ask "Review this function" -f src/main.py
-ai-coder ask "Explain the bug" -f app.py --model llama3.2
+farcode ask "What is a context manager?"
+farcode ask "Review this function" -f src/main.py
+farcode ask "Explain the bug" -f app.py --model llama3.2
 ```
 
 ### `chat` — Interactive multi-turn session
 
 ```bash
-ai-coder chat                       # fresh session
-ai-coder chat -c                    # resume last session
-ai-coder chat -f src/main.py        # pre-load a file
-ai-coder chat -b                    # background mode (type while AI works)
-ai-coder chat --allow-bash          # skip confirmation on shell commands
-ai-coder chat --allow-all           # auto-approve ALL tool calls, no prompts
+farcode chat                       # fresh session
+farcode chat -c                    # resume last session
+farcode chat -f src/main.py        # pre-load a file
+farcode chat -b                    # background mode (type while AI works)
+farcode chat --allow-bash          # skip confirmation on shell commands
+farcode chat --allow-all           # auto-approve ALL tool calls, no prompts
 ```
 
 **In-session commands:**
@@ -43,30 +43,31 @@ ai-coder chat --allow-all           # auto-approve ALL tool calls, no prompts
 | `/file <path>` | Inject a file into the conversation |
 | `/model <name>` | Switch model mid-session |
 | `/resume` | Pick a saved session to resume |
+| `/rules` | Show the currently-loaded `CODER.md` rules |
 | `/exit` or `/quit` | Exit chat |
 
 ### `review` — Code review
 
 ```bash
-ai-coder review src/auth.py
+farcode review src/auth.py
 ```
 
 ### `explain` — Code explanation
 
 ```bash
-ai-coder explain src/utils.py
+farcode explain src/utils.py
 ```
 
 ### `sessions` — Manage saved sessions
 
 ```bash
-ai-coder sessions list              # list recent sessions
-ai-coder sessions list -n 50        # show up to 50 sessions
-ai-coder sessions search "auth"     # search by title
-ai-coder sessions delete <id>       # delete by full ID or unique prefix
+farcode sessions list              # list recent sessions
+farcode sessions list -n 50        # show up to 50 sessions
+farcode sessions search "auth"     # search by title
+farcode sessions delete <id>       # delete by full ID or unique prefix
 ```
 
-Sessions are auto-saved to `~/.ai_coder_sessions/` after each turn.
+Sessions are auto-saved to `~/.farcode_sessions/` after each turn.
 
 ## AI Tools
 
@@ -81,6 +82,26 @@ During `chat`, the AI can use these tools autonomously:
 | `search_in_files(pattern, path, file_pattern)` | Regex search across files (cap: 200 results) |
 | `create_file(path, content)` | Create a new file (fails if already exists) |
 
+## Project rules: `CODER.md`
+
+Drop a `CODER.md` file in your project root and farcode will append its contents to the system prompt for every `chat` and `ask` invocation. Use it for project-specific conventions the model should respect — coding style, framework choices, files to leave alone.
+
+```markdown
+# CODER.md
+
+- Use type hints on all public functions.
+- Prefer `pathlib.Path` over `os.path`.
+- Never edit files under `vendor/`.
+- Tests live in `tests/`, not next to source.
+```
+
+**Discovery order** (later files override earlier ones in the assembled prompt):
+
+1. `~/.coder.md` — your personal rules, applied to every project
+2. Each `CODER.md` walking up from the current directory to the repo root (the directory containing `.git`). Outermost ancestor first, project root last.
+
+Each file is capped at 16 KB. Use `/rules` inside `chat` to inspect what was loaded.
+
 ## Safety: run_bash
 
 By default, the AI will ask for your confirmation before running any shell command:
@@ -94,8 +115,8 @@ Allow bash command?
 To skip these prompts in a trusted environment:
 
 ```bash
-ai-coder chat --allow-bash   # skip confirmation for shell commands only
-ai-coder chat --allow-all    # auto-approve ALL tool calls without any prompt
+farcode chat --allow-bash   # skip confirmation for shell commands only
+farcode chat --allow-all    # auto-approve ALL tool calls without any prompt
 ```
 
 On **Windows**, `run_bash` uses PowerShell (`pwsh` or `powershell`) so that

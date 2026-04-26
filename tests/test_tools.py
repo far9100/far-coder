@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from ai_coder.tools import (
+from farcode.tools import (
     _create_file,
     _edit_file,
     _list_directory,

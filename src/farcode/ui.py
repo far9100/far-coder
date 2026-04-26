@@ -47,10 +47,10 @@ def print_info(msg: str) -> None:
 def print_welcome(model: str) -> None:
     console.print()
     console.print(
-        f"[bold cyan]AI Coder[/] — powered by [bold yellow]{model}[/]\n"
+        f"[bold cyan]FarCode[/] — powered by [bold yellow]{model}[/]\n"
         "[dim]Enter[/] send  [dim]Alt+Enter[/] newline  "
         "[dim]↑↓[/] history  [dim]@file[/] attach\n"
-        "[dim]/clear  /file <path>  /model [name]  /resume  /exit[/]"
+        "[dim]/clear  /compact  /file <path>  /model [name]  /resume  /rules  /exit[/]"
     )
     console.print()
 
@@ -73,6 +73,38 @@ def _truncate(s: str, n: int) -> str:
     return s[:n] + f"\n[dim]... ({len(s) - n} more chars)[/]"
 
 
+def _ctx_indicator_markup(stats: StreamStats) -> str:
+    """Return `  [color]ctx 28K/64K[/]` markup for the title line, or '' if unset."""
+    if stats.ctx_size <= 0:
+        return ""
+    used_k = max(0, stats.input_tokens) // 1024
+    total_k = max(1, stats.ctx_size // 1024)
+    ratio = stats.input_tokens / stats.ctx_size if stats.ctx_size else 0.0
+    if ratio >= 0.85:
+        color = "bold red"
+    elif ratio >= 0.60:
+        color = "yellow"
+    else:
+        color = "green"
+    return f"  [{color}]ctx {used_k}K/{total_k}K[/]"
+
+
+def _ctx_indicator_text(stats: StreamStats) -> tuple[str, str] | None:
+    """Same as _ctx_indicator_markup but for rich.Text; returns (text, style) or None."""
+    if stats.ctx_size <= 0:
+        return None
+    used_k = max(0, stats.input_tokens) // 1024
+    total_k = max(1, stats.ctx_size // 1024)
+    ratio = stats.input_tokens / stats.ctx_size if stats.ctx_size else 0.0
+    if ratio >= 0.85:
+        style = "bold red"
+    elif ratio >= 0.60:
+        style = "yellow"
+    else:
+        style = "green"
+    return (f"ctx {used_k}K/{total_k}K", style)
+
+
 def render_response(content: str, stats: StreamStats) -> None:
     """Print a static assistant response at the *current* terminal width."""
     if not content.strip():
@@ -80,6 +112,7 @@ def render_response(content: str, stats: StreamStats) -> None:
     title = (
         f"[bold cyan]Assistant[/]  "
         f"[dim]{stats.elapsed:.1f}s | {stats.token_count} tok[/]"
+        f"{_ctx_indicator_markup(stats)}"
     )
     console.print()
     console.print(title)
@@ -117,11 +150,16 @@ class _LiveDisplay:
         tokens = self._stats.token_count
 
         if self._text:
-            title = Text.assemble(
+            parts = [
                 ("Assistant", "bold cyan"),
                 ("  ", ""),
                 (f"{elapsed:.1f}s | {tokens} tok", "dim"),
-            )
+            ]
+            ctx = _ctx_indicator_text(self._stats)
+            if ctx:
+                parts.append(("  ", ""))
+                parts.append(ctx)
+            title = Text.assemble(*parts)
             yield from console_obj.render(title, options)
             yield from console_obj.render(Markdown(self._text), options)
         else:
