@@ -18,6 +18,11 @@ def set_bash_require_confirm(val: bool) -> None:
     _bash_require_confirm = val
 
 
+def bash_require_confirm() -> bool:
+    """Return True when run_bash should prompt for confirmation."""
+    return _bash_require_confirm
+
+
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",

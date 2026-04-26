@@ -49,7 +49,8 @@ def print_welcome(model: str) -> None:
     console.print(
         f"[bold cyan]FarCode[/] — powered by [bold yellow]{model}[/]\n"
         "[dim]Enter[/] send  [dim]Alt+Enter[/] newline  "
-        "[dim]↑↓[/] history  [dim]@file[/] attach\n"
+        "[dim]↑↓[/] history  [dim]@file[/] attach  "
+        "[dim]Shift+Tab[/] toggle auto-approve\n"
         "[dim]/clear  /compact  /file <path>  /model [name]  /resume  /rules  /exit[/]"
     )
     console.print()
