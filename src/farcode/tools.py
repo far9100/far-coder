@@ -1,4 +1,7 @@
+import ast
 import fnmatch
+import json as _json
+import os
 import re
 import shutil
 import subprocess
@@ -23,15 +26,32 @@ def bash_require_confirm() -> bool:
     return _bash_require_confirm
 
 
+# ── Per-turn tool-call cap ────────────────────────────────────────────────────
+
+def max_tools_per_turn() -> int:
+    """Cap on tool calls executed in a single agent turn.
+
+    Small models often emit one good call plus one malformed one. Defaulting
+    to 1 forces serial execution, which dramatically improves reliability on
+    qwen3-class 4B models. Set FARCODE_MAX_TOOLS_PER_TURN=0 (or any large
+    number) to allow parallel calls again.
+    """
+    raw = os.environ.get("FARCODE_MAX_TOOLS_PER_TURN", "1")
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return n if n > 0 else 999
+
+
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
             "description": (
-                "Read a file's contents. By default returns the whole file (capped at "
-                "~50 KB). Use offset and limit (1-based line numbers) to read a specific "
-                "slice of a large file."
+                "Read a file. Returns full file (capped at ~50 KB) or a 1-based "
+                "line slice via offset/limit. ALWAYS read before editing."
             ),
             "parameters": {
                 "type": "object",
@@ -55,9 +75,9 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "edit_file",
             "description": (
-                "Edit a file by replacing an exact string with new content. "
-                "old_str must match exactly (whitespace and indentation included). "
-                "Only the first occurrence is replaced."
+                "Replace the first occurrence of old_str with new_str. Tries an "
+                "exact match first, then falls back to whitespace-tolerant matching. "
+                "If it still misses, use replace_lines or write_file instead of guessing."
             ),
             "parameters": {
                 "type": "object",
@@ -65,7 +85,7 @@ TOOL_SCHEMAS: list[dict] = [
                     "path": {"type": "string", "description": "Path to the file to edit"},
                     "old_str": {
                         "type": "string",
-                        "description": "Exact string to find and replace",
+                        "description": "String to find — exact preferred, but whitespace mismatch is tolerated",
                     },
                     "new_str": {
                         "type": "string",
@@ -79,10 +99,40 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "replace_lines",
+            "description": (
+                "Replace lines start_line through end_line (1-based, inclusive) with "
+                "new_content. Easier than edit_file for multi-line changes when you "
+                "have the exact line numbers from a recent read_file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to replace (1-based)",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to replace, inclusive (1-based)",
+                    },
+                    "new_content": {
+                        "type": "string",
+                        "description": "Replacement text. Newline at end is added if missing.",
+                    },
+                },
+                "required": ["path", "start_line", "end_line", "new_content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": (
-                "Write content to a file, creating it if it does not exist or overwriting it if it does. "
-                "Use this whenever you need to create or fully replace a file."
+                "Create or overwrite a file with the given content. The safe fallback "
+                "when edit_file or replace_lines fail."
             ),
             "parameters": {
                 "type": "object",
@@ -100,7 +150,9 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "run_bash",
             "description": (
                 "Run a PowerShell command on Windows and return stdout + stderr. "
-                "Use PowerShell syntax: chain with `;` not `&&`, use `Remove-Item -Recurse -Force` not `rm -rf`."
+                "PowerShell syntax: chain with `;` not `&&`; delete with "
+                "`Remove-Item -Recurse -Force path` not `rm -rf`; rename with "
+                "`Move-Item src dst`. Default timeout 30s."
             ),
             "parameters": {
                 "type": "object",
@@ -240,6 +292,7 @@ def execute_tool(name: str, arguments: dict) -> str:
         "read_file": _read_file,
         "write_file": _write_file,
         "edit_file": _edit_file,
+        "replace_lines": _replace_lines,
         "run_bash": _run_bash,
         "list_directory": _list_directory,
         "search_in_files": _search_in_files,
@@ -256,6 +309,97 @@ def execute_tool(name: str, arguments: dict) -> str:
         return f"Tool call error (bad arguments): {e}"
     except Exception as e:
         return f"Tool error: {e}"
+
+
+# ── Post-edit syntax check ────────────────────────────────────────────────────
+
+def _check_syntax(path: str) -> str:
+    """Return "" on success, " | <msg>" on failure. Quick, in-process when possible.
+
+    Skips silently for unrecognized extensions and for tools that are missing.
+    Output is suffixed onto the tool result so the model can self-correct.
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+    if not p.is_file():
+        return ""
+    try:
+        if ext == ".py":
+            try:
+                ast.parse(p.read_text(encoding="utf-8", errors="replace"), filename=str(p))
+            except SyntaxError as e:
+                return f" | syntax error: line {e.lineno}: {e.msg}"
+            return ""
+        if ext == ".json":
+            try:
+                _json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            except _json.JSONDecodeError as e:
+                return f" | json error: line {e.lineno}: {e.msg}"
+            return ""
+        if ext in (".js", ".mjs", ".cjs"):
+            node = shutil.which("node")
+            if not node:
+                return ""
+            r = subprocess.run(
+                [node, "--check", str(p)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout).strip().splitlines()
+                msg = err[0] if err else "syntax error"
+                return f" | js syntax error: {msg[:200]}"
+            return ""
+        if ext in (".ts", ".tsx"):
+            tsc = shutil.which("tsc")
+            if not tsc:
+                return ""
+            r = subprocess.run(
+                [tsc, "--noEmit", "--allowJs", str(p)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                err = (r.stdout or r.stderr).strip().splitlines()
+                msg = err[0] if err else "type error"
+                return f" | tsc error: {msg[:200]}"
+            return ""
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return ""
+
+
+# ── Snapshot hooks (for /undo, populated in chat session) ────────────────────
+
+_snapshot_before: "list[tuple[str, str | None]]" = []
+_snapshot_max = 20
+
+
+def _snapshot_before_write(path: str, prev_content: str) -> None:
+    """Record the file's pre-edit content so /undo can restore it."""
+    _snapshot_before.append((str(Path(path).resolve()), prev_content))
+    if len(_snapshot_before) > _snapshot_max:
+        del _snapshot_before[: len(_snapshot_before) - _snapshot_max]
+
+
+def _snapshot_after_write(path: str) -> None:
+    """For new-file writes where there's no prior content; pre = None."""
+    p = Path(path).resolve()
+    # Only record if we don't already have a snapshot for this write
+    if not _snapshot_before or _snapshot_before[-1][0] != str(p):
+        _snapshot_before.append((str(p), None))
+        if len(_snapshot_before) > _snapshot_max:
+            del _snapshot_before[: len(_snapshot_before) - _snapshot_max]
+
+
+def pop_snapshot() -> tuple[str, str | None] | None:
+    """Pop the most recent snapshot; used by /undo."""
+    if not _snapshot_before:
+        return None
+    return _snapshot_before.pop()
+
+
+def clear_snapshots() -> None:
+    """Wipe the snapshot stack, e.g. when a session starts."""
+    _snapshot_before.clear()
 
 
 def _read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
@@ -286,11 +430,45 @@ def _write_file(path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"OK: {action} {path}"
+        _snapshot_after_write(path)
+        return f"OK: {action} {path}{_check_syntax(path)}"
     except PermissionError:
         return f"Error: Permission denied: {path}"
     except OSError as e:
         return f"Error: {e}"
+
+
+def _fuzzy_locate(content: str, old_str: str) -> tuple[int, int] | None:
+    """Locate old_str in content with whitespace tolerance.
+
+    Tries: (1) exact substring; (2) line-stripped match — each line in old_str
+    has its leading/trailing whitespace stripped, then we look for a sequence of
+    consecutive lines in content that strip to the same thing.
+
+    Returns (start_offset, end_offset) into the original content on success,
+    or None if nothing matches. The returned span uses the original (un-stripped)
+    text indices so the caller can splice content[start:end] cleanly.
+    """
+    idx = content.find(old_str)
+    if idx >= 0:
+        return idx, idx + len(old_str)
+
+    target_lines = [ln.strip() for ln in old_str.splitlines()]
+    target_lines = [ln for ln in target_lines if ln]
+    if not target_lines:
+        return None
+
+    content_lines = content.splitlines(keepends=True)
+    stripped = [ln.strip() for ln in content_lines]
+
+    n = len(target_lines)
+    for i in range(len(stripped) - n + 1):
+        window = [s for s in stripped[i:i + n] if s]
+        if window == target_lines:
+            start_off = sum(len(content_lines[k]) for k in range(i))
+            end_off = start_off + sum(len(content_lines[k]) for k in range(i, i + n))
+            return start_off, end_off
+    return None
 
 
 def _edit_file(path: str, old_str: str, new_str: str) -> str:
@@ -298,15 +476,63 @@ def _edit_file(path: str, old_str: str, new_str: str) -> str:
     if not p.exists():
         return f"Error: File not found: {path}"
     content = p.read_text(encoding="utf-8", errors="replace")
-    if old_str not in content:
+
+    span = _fuzzy_locate(content, old_str)
+    if span is None:
         return (
             f"Error: old_str not found in {path}.\n"
-            "Make sure whitespace and indentation match exactly."
+            "Tried exact match and whitespace-tolerant match. Either re-read the "
+            "file (it may have changed), or use replace_lines / write_file instead."
         )
-    count = content.count(old_str)
-    p.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
-    note = f" ({count} occurrences, only first replaced)" if count > 1 else ""
-    return f"OK: edited {path}{note}"
+    start, end = span
+    note = ""
+    if content[start:end] != old_str:
+        note = " (matched with whitespace tolerance)"
+    elif content.count(old_str) > 1:
+        note = f" ({content.count(old_str)} occurrences, only first replaced)"
+
+    new_content = content[:start] + new_str + content[end:]
+    _snapshot_before_write(path, content)
+    p.write_text(new_content, encoding="utf-8")
+    _snapshot_after_write(path)
+    return f"OK: edited {path}{note}{_check_syntax(path)}"
+
+
+def _replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
+    """Replace lines [start_line, end_line] (1-based, inclusive) with new_content."""
+    p = Path(path)
+    if not p.exists():
+        return f"Error: File not found: {path}"
+    try:
+        start_line = int(start_line)
+        end_line = int(end_line)
+    except (TypeError, ValueError):
+        return "Error: start_line and end_line must be integers"
+    if start_line < 1 or end_line < start_line:
+        return f"Error: invalid line range {start_line}-{end_line}"
+
+    text = p.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    if start_line > len(lines):
+        return (
+            f"Error: start_line {start_line} is past end of file "
+            f"({len(lines)} lines). Use write_file to append, or read_file first."
+        )
+    end_line = min(end_line, len(lines))
+
+    new = new_content if new_content.endswith("\n") or end_line == len(lines) and not lines[-1].endswith("\n") else new_content + "\n"
+    if not new_content:
+        new = ""
+
+    spliced = lines[:start_line - 1] + ([new] if new else []) + lines[end_line:]
+    _snapshot_before_write(path, text)
+    p.write_text("".join(spliced), encoding="utf-8")
+    _snapshot_after_write(path)
+    replaced = end_line - start_line + 1
+    return (
+        f"OK: replaced {replaced} line{'s' if replaced != 1 else ''} in {path} "
+        f"(lines {start_line}-{end_line}){_check_syntax(path)}"
+    )
 
 
 def _run_bash(command: str, timeout: int = 30) -> str:
@@ -437,7 +663,8 @@ def _create_file(path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"OK: created {path}"
+        _snapshot_after_write(path)
+        return f"OK: created {path}{_check_syntax(path)}"
     except PermissionError:
         return f"Error: Permission denied: {path}"
     except OSError as e:

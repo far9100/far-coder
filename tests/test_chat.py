@@ -173,3 +173,102 @@ def test_auto_compact_returns_original_when_summary_fails(monkeypatch):
     # On summary failure, return the original unchanged so the caller can fall
     # back to hard-trimming.
     assert out is msgs
+
+
+# ── _run_agent_turn tool-call cap ─────────────────────────────────────────────
+
+class _StubFn:
+    def __init__(self, name, args):
+        self.name = name
+        self.arguments = args
+
+
+class _StubToolCall:
+    def __init__(self, name, args):
+        self.function = _StubFn(name, args)
+
+
+class _StubMessage:
+    def __init__(self, content, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls or []
+
+
+class _StubResponse:
+    def __init__(self, content, tool_calls=None, eval_count=10, prompt_eval_count=20):
+        self.message = _StubMessage(content, tool_calls)
+        self.eval_count = eval_count
+        self.prompt_eval_count = prompt_eval_count
+
+
+def test_agent_turn_caps_tool_calls(monkeypatch):
+    """When the model returns N>cap tools, only `cap` get executed and the
+    rest get a single tool message noting they were dropped."""
+    monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "1")
+
+    # First call: model returns 3 tool calls. Second call: model returns no tools.
+    responses = iter([
+        _StubResponse(
+            "calling tools",
+            tool_calls=[
+                _StubToolCall("read_file", {"path": "a.txt"}),
+                _StubToolCall("read_file", {"path": "b.txt"}),
+                _StubToolCall("read_file", {"path": "c.txt"}),
+            ],
+        ),
+        _StubResponse("done", tool_calls=[]),
+    ])
+
+    monkeypatch.setattr(chat, "call_with_thinking", lambda fn, stats: fn())
+    monkeypatch.setattr(chat, "call_nonstream", lambda *a, **kw: next(responses))
+    monkeypatch.setattr(chat, "render_response", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_error", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+
+    executed = []
+
+    def fake_execute(name, args):
+        executed.append((name, args))
+        return f"result for {args.get('path', '?')}"
+
+    monkeypatch.setattr(chat, "execute_tool", fake_execute)
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    chat._run_agent_turn(msgs, model="m", num_ctx=8192, num_predict=512)
+
+    # Only one tool actually ran
+    assert len(executed) == 1
+    assert executed[0] == ("read_file", {"path": "a.txt"})
+
+    # Assistant message records only the capped tool_calls (1)
+    assistant_msgs = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(assistant_msgs[0]["tool_calls"]) == 1
+
+    # A "dropped" notice was appended as a tool message
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert any("dropped" in (m.get("content") or "") for m in tool_msgs)
+
+
+def test_agent_turn_no_cap_message_when_under_limit(monkeypatch):
+    monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "5")
+
+    responses = iter([
+        _StubResponse(
+            "x",
+            tool_calls=[_StubToolCall("read_file", {"path": "a.txt"})],
+        ),
+        _StubResponse("done", tool_calls=[]),
+    ])
+    monkeypatch.setattr(chat, "call_with_thinking", lambda fn, stats: fn())
+    monkeypatch.setattr(chat, "call_nonstream", lambda *a, **kw: next(responses))
+    monkeypatch.setattr(chat, "render_response", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "execute_tool", lambda name, args: "ok")
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    chat._run_agent_turn(msgs, model="m", num_ctx=8192, num_predict=512)
+
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert not any("dropped" in (m.get("content") or "") for m in tool_msgs)

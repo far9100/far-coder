@@ -22,7 +22,15 @@ from .client import (
 from .coder_md import find_coder_md_files, load_coder_md
 from .memory import append_entry, current_project_path
 from .sessions import Session, load_sessions, new_session, save_session
-from .tools import TOOL_SCHEMAS, bash_require_confirm, execute_tool, set_bash_require_confirm
+from .tools import (
+    TOOL_SCHEMAS,
+    bash_require_confirm,
+    clear_snapshots,
+    execute_tool,
+    max_tools_per_turn,
+    pop_snapshot,
+    set_bash_require_confirm,
+)
 from .ui import (
     call_with_thinking,
     console,
@@ -464,6 +472,16 @@ def _run_agent_turn(
             render_response(content, stats)
             return
 
+        cap = max_tools_per_turn()
+        dropped = 0
+        if len(tool_calls) > cap:
+            dropped = len(tool_calls) - cap
+            tool_calls = tool_calls[:cap]
+            print_info(
+                f"[dim]Dropped {dropped} extra tool call(s); cap is {cap}/turn "
+                f"(set FARCODE_MAX_TOOLS_PER_TURN to change).[/]"
+            )
+
         messages.append({
             "role": "assistant",
             "content": content,
@@ -481,6 +499,15 @@ def _run_agent_turn(
         tool_results = _run_tools_parallel(tool_calls)
         for _name, _args, result in tool_results:
             messages.append({"role": "tool", "content": result})
+        if dropped:
+            messages.append({
+                "role": "tool",
+                "content": (
+                    f"[note: {dropped} additional tool call(s) were dropped — "
+                    "this agent runs one tool per turn by default. Issue follow-up "
+                    "calls in the next turn.]"
+                ),
+            })
 
 
 # ── Main chat loop ────────────────────────────────────────────────────────────
