@@ -199,23 +199,33 @@ def _run_bash(command: str, timeout: int = 30) -> str:
             return "run_bash denied: not running in an interactive terminal"
         if not Confirm.ask(f"[yellow]Allow bash command?[/]\n  {command}"):
             return "run_bash denied: user declined"
-    bash = shutil.which("bash")
     try:
-        if bash:
-            result = subprocess.run(
-                [bash, "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+        if sys.platform == "win32":
+            shell_exe = shutil.which("pwsh") or shutil.which("powershell")
+            if shell_exe:
+                result = subprocess.run(
+                    [shell_exe, "-NoProfile", "-NonInteractive", "-Command", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            else:
+                result = subprocess.run(
+                    command, shell=True, capture_output=True, text=True, timeout=timeout,
+                )
         else:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            bash = shutil.which("bash")
+            if bash:
+                result = subprocess.run(
+                    [bash, "-c", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            else:
+                result = subprocess.run(
+                    command, shell=True, capture_output=True, text=True, timeout=timeout,
+                )
     except subprocess.TimeoutExpired:
         return f"Error: command timed out after {timeout}s"
 
