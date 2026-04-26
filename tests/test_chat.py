@@ -272,3 +272,118 @@ def test_agent_turn_no_cap_message_when_under_limit(monkeypatch):
 
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
     assert not any("dropped" in (m.get("content") or "") for m in tool_msgs)
+
+
+# ── _summary_model ────────────────────────────────────────────────────────────
+
+def test_summary_model_falls_back_to_main_when_unset(monkeypatch):
+    monkeypatch.delenv("FARCODE_SUMMARY_MODEL", raising=False)
+    assert chat._summary_model("qwen3.5:4b") == "qwen3.5:4b"
+
+
+def test_summary_model_uses_env_when_set(monkeypatch):
+    monkeypatch.setenv("FARCODE_SUMMARY_MODEL", "qwen3:0.5b")
+    assert chat._summary_model("qwen3.5:4b") == "qwen3:0.5b"
+
+
+def test_summary_model_blank_env_falls_back(monkeypatch):
+    monkeypatch.setenv("FARCODE_SUMMARY_MODEL", "   ")
+    assert chat._summary_model("main") == "main"
+
+
+def test_summarize_turns_uses_summary_model(monkeypatch):
+    monkeypatch.setenv("FARCODE_SUMMARY_MODEL", "tiny-model")
+
+    captured = {}
+
+    class _M:
+        def __init__(self, c): self.content = c
+    class _R:
+        def __init__(self, c): self.message = _M(c)
+
+    def fake_call(msgs, model, tools=None, num_ctx=0, num_predict=0):
+        captured["model"] = model
+        return _R("- bullet")
+
+    monkeypatch.setattr(chat, "call_nonstream", fake_call)
+
+    out = chat._summarize_turns(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        model="qwen3.5:4b", num_ctx=8192,
+    )
+    assert out == "- bullet"
+    assert captured["model"] == "tiny-model"
+
+
+# ── _undo_last_write ──────────────────────────────────────────────────────────
+
+def test_undo_last_write_restores_prior_content(tmp_path):
+    from farcode.tools import _edit_file, clear_snapshots
+
+    clear_snapshots()
+    f = tmp_path / "x.txt"
+    f.write_text("original", encoding="utf-8")
+    _edit_file(str(f), "original", "modified")
+    assert f.read_text(encoding="utf-8") == "modified"
+
+    msg = chat._undo_last_write()
+    assert "Undone" in msg
+    assert f.read_text(encoding="utf-8") == "original"
+
+
+def test_undo_last_write_deletes_newly_created_file(tmp_path):
+    from farcode.tools import _create_file, clear_snapshots
+
+    clear_snapshots()
+    f = tmp_path / "fresh.txt"
+    _create_file(str(f), "content")
+    assert f.exists()
+
+    msg = chat._undo_last_write()
+    assert "deleted" in msg
+    assert not f.exists()
+
+
+def test_undo_last_write_empty_stack():
+    from farcode.tools import clear_snapshots
+
+    clear_snapshots()
+    assert chat._undo_last_write() == "Nothing to undo."
+
+
+def test_undo_pops_only_one_entry(tmp_path):
+    from farcode.tools import _edit_file, clear_snapshots
+
+    clear_snapshots()
+    f = tmp_path / "y.txt"
+    f.write_text("v1", encoding="utf-8")
+    _edit_file(str(f), "v1", "v2")
+    _edit_file(str(f), "v2", "v3")
+
+    chat._undo_last_write()  # back to v2
+    assert f.read_text(encoding="utf-8") == "v2"
+    chat._undo_last_write()  # back to v1
+    assert f.read_text(encoding="utf-8") == "v1"
+
+
+# ── _show_git_diff ────────────────────────────────────────────────────────────
+
+def test_show_git_diff_outside_a_repo_does_not_crash(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out = chat._show_git_diff()
+    # Either "git diff returned N: not a git repository" or an empty result.
+    assert isinstance(out, str)
+
+
+# ── _reindex_code ─────────────────────────────────────────────────────────────
+
+def test_reindex_code_with_no_files_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # Stub Ollama embed so no actual model call happens
+    if "farcode.embeddings" in __import__("sys").modules:
+        del __import__("sys").modules["farcode.embeddings"]
+    from farcode import embeddings as emb
+    monkeypatch.setattr(emb, "_embed_texts", lambda texts: [])
+
+    out = chat._reindex_code()
+    assert "Indexed 0" in out

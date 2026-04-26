@@ -1,6 +1,9 @@
 import math
+import os
 import queue as _queue
 import re
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -48,6 +51,14 @@ DEFAULT_MODEL = "qwen3.5:4b"
 _CHARS_PER_TOKEN = 3.5
 _HEADROOM_FRAC = 0.10
 _AUTO_COMPACT_THRESHOLD = 0.80
+
+
+def _summary_model(default_model: str) -> str:
+    """Use FARCODE_SUMMARY_MODEL for compaction/session summary if set; else
+    fall back to the chat's main model. A tiny model (e.g. qwen3:0.5b) is
+    plenty for "turn 3000 chars into 4 bullets" and frees the main model from
+    cold-cache reload between turns."""
+    return os.environ.get("FARCODE_SUMMARY_MODEL", "").strip() or default_model
 
 
 # ── Token accounting ─────────────────────────────────────────────────────────
@@ -122,7 +133,8 @@ def _summarize_turns(turns: list[dict], model: str, num_ctx: int) -> str:
     ]
     try:
         response = call_nonstream(
-            summarize_msgs, model, tools=None, num_ctx=num_ctx, num_predict=512
+            summarize_msgs, _summary_model(model), tools=None,
+            num_ctx=num_ctx, num_predict=512,
         )
         return (response.message.content or "").strip()
     except Exception:
@@ -297,7 +309,8 @@ def _summarize_session(session: Session, model: str, num_ctx: int) -> None:
             {"role": "user", "content": f"Summarize this coding session:\n\n{conv}"},
         ]
         response = call_nonstream(
-            summarize_msgs, model, tools=None, num_ctx=num_ctx, num_predict=512
+            summarize_msgs, _summary_model(model), tools=None,
+            num_ctx=num_ctx, num_predict=512,
         )
         summary = (response.message.content or "").strip()
         if summary:
@@ -354,6 +367,66 @@ def _pick_session() -> Session | None:
     except (EOFError, KeyboardInterrupt):
         console.print("")
         return None
+
+
+# ── Undo / diff / reindex ────────────────────────────────────────────────────
+
+def _undo_last_write() -> str:
+    """Restore the most recent file mutation. Pops the snapshot stack."""
+    snap = pop_snapshot()
+    if snap is None:
+        return "Nothing to undo."
+    path, prev = snap
+    p = Path(path)
+    try:
+        if prev is None:
+            # The snapshot represented a newly-created file — undo means delete.
+            if p.exists():
+                p.unlink()
+            return f"Undone: deleted {path} (was newly created)."
+        p.write_text(prev, encoding="utf-8")
+        return f"Undone: restored {path} ({len(prev)} chars)."
+    except OSError as e:
+        return f"Undo failed for {path}: {e}"
+
+
+def _show_git_diff() -> str:
+    """Return `git diff` against HEAD as a string. Only meaningful if the cwd
+    is a git repo. Falls back to a tracked-files-modified message otherwise."""
+    if not shutil.which("git"):
+        return "git not available."
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--no-color"],
+            capture_output=True, text=True, timeout=10, cwd=os.getcwd(),
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"git diff failed: {e}"
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip()
+        return f"git diff returned {r.returncode}: {msg or '(no message)'}"
+    out = r.stdout.rstrip()
+    if not out:
+        return "(no working-tree changes)"
+    if len(out) > 8000:
+        out = out[:8000] + "\n... [diff truncated; run `git diff` directly to see full output]"
+    return out
+
+
+def _reindex_code() -> str:
+    """Force a full rebuild of the embedding index for the current project."""
+    try:
+        from .embeddings import index_project
+    except ImportError as e:
+        return f"reindex unavailable: {e}"
+    try:
+        n = index_project(force=True)
+    except Exception as e:
+        return (
+            f"reindex error: {e}\n"
+            "If this says 'model not found', run: ollama pull nomic-embed-text"
+        )
+    return f"Indexed {n} code chunk(s)."
 
 
 # ── File / @mention helpers ───────────────────────────────────────────────────
@@ -521,6 +594,7 @@ def run_chat(
     num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> None:
     check_ollama(model, num_ctx=num_ctx)
+    clear_snapshots()  # /undo only spans the current session
     current_model = model
     current_session: Session | None = None
     messages = build_system_messages(num_ctx=num_ctx)
@@ -672,6 +746,22 @@ def run_chat(
                 console.print()
                 console.print(rules)
                 console.print()
+            continue
+
+        if cmd == "/undo":
+            _wait_idle()
+            console.print(_undo_last_write())
+            continue
+
+        if cmd == "/diff":
+            _wait_idle()
+            diff = _show_git_diff()
+            console.print(diff)
+            continue
+
+        if cmd == "/reindex":
+            _wait_idle()
+            print_info(_reindex_code())
             continue
 
         if cmd == "/resume":

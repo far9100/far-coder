@@ -257,6 +257,34 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "recall_code",
+            "description": (
+                "Semantic + keyword search over indexed code chunks in the current "
+                "project. Use this when you need to find a function/class by what "
+                "it DOES rather than its exact name (e.g. \"the rate limiter\" or "
+                "\"where we parse JWT tokens\"). Returns up to 5 code chunks with "
+                "file:line ranges. Triggers on-demand indexing on first call; "
+                "requires `ollama pull nomic-embed-text` (or set FARCODE_EMBED_MODEL)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language description of what you're looking for",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max results (default 5)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_memory",
             "description": (
                 "Record a one-sentence lesson from the current session so it survives "
@@ -298,6 +326,7 @@ def execute_tool(name: str, arguments: dict) -> str:
         "search_in_files": _search_in_files,
         "create_file": _create_file,
         "recall_memory": _recall_memory,
+        "recall_code": _recall_code,
         "save_memory": _save_memory,
     }
     handler = handlers.get(name)
@@ -715,3 +744,22 @@ def _save_memory(
         return "OK: memory saved"
     except Exception as e:
         return f"Error saving memory: {e}"
+
+
+def _recall_code(query: str, top_k: int = 5) -> str:
+    try:
+        from .embeddings import format_results, hybrid_search, index_project
+    except ImportError as e:
+        return f"recall_code unavailable: {e}"
+    try:
+        # Lazy index — first call in a session ensures we have something to search.
+        # Skips files already indexed at the same mtime, so this is cheap on
+        # subsequent calls.
+        index_project()
+        results = hybrid_search(query, top_k=top_k)
+    except Exception as e:
+        return (
+            f"recall_code error: {e}\n"
+            "If this says 'model not found', run: ollama pull nomic-embed-text"
+        )
+    return format_results(results)

@@ -51,7 +51,8 @@ def print_welcome(model: str) -> None:
         "[dim]Enter[/] send  [dim]Alt+Enter[/] newline  "
         "[dim]↑↓[/] history  [dim]@file[/] attach  "
         "[dim]Shift+Tab[/] toggle auto-approve\n"
-        "[dim]/clear  /compact  /file <path>  /model [name]  /resume  /rules  /exit[/]"
+        "[dim]/clear  /compact  /file <path>  /model [name]  /resume  /rules  "
+        "/diff  /undo  /reindex  /exit[/]"
     )
     console.print()
 
