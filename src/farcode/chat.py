@@ -22,7 +22,7 @@ from .client import (
 from .coder_md import find_coder_md_files, load_coder_md
 from .memory import append_entry, current_project_path
 from .sessions import Session, load_sessions, new_session, save_session
-from .tools import TOOL_SCHEMAS, execute_tool
+from .tools import TOOL_SCHEMAS, bash_require_confirm, execute_tool, set_bash_require_confirm
 from .ui import (
     call_with_thinking,
     console,
@@ -198,11 +198,30 @@ def _make_prompt_session() -> PromptSession:
     def _newline(event):
         event.current_buffer.insert_text("\n")
 
+    @kb.add("s-tab")
+    def _toggle_auto_approve(event):
+        set_bash_require_confirm(not bash_require_confirm())
+        event.app.invalidate()
+
+    def _bottom_toolbar():
+        if bash_require_confirm():
+            return HTML(
+                '<style fg="ansiyellow">[shift+tab]</style> '
+                'auto-approve: <style fg="ansired">OFF</style> '
+                '<style fg="ansibrightblack">(tool calls require confirmation)</style>'
+            )
+        return HTML(
+            '<style fg="ansiyellow">[shift+tab]</style> '
+            'auto-approve: <style fg="ansigreen">ON</style> '
+            '<style fg="ansibrightblack">(all tool calls auto-approved)</style>'
+        )
+
     return PromptSession(
         key_bindings=kb,
         style=_PROMPT_STYLE,
         multiline=True,
         history=FileHistory(str(_HISTORY_FILE)),
+        bottom_toolbar=_bottom_toolbar,
     )
 
 
