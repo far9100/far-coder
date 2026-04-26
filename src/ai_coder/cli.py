@@ -138,6 +138,10 @@ def chat(
         bool,
         typer.Option("--allow-bash", help="Skip confirmation prompts for run_bash tool calls"),
     ] = False,
+    allow_all: Annotated[
+        bool,
+        typer.Option("--allow-all", help="Auto-approve ALL tool calls without any confirmation prompt"),
+    ] = False,
 ) -> None:
     """Start an interactive multi-turn chat session."""
     from .chat import run_chat
@@ -150,7 +154,7 @@ def chat(
             from .ui import print_info
             print_info("No saved sessions found — starting fresh.")
 
-    if allow_bash:
+    if allow_all or allow_bash:
         from .tools import set_bash_require_confirm
         set_bash_require_confirm(False)
 

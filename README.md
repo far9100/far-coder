@@ -32,6 +32,7 @@ ai-coder chat -c                    # resume last session
 ai-coder chat -f src/main.py        # pre-load a file
 ai-coder chat -b                    # background mode (type while AI works)
 ai-coder chat --allow-bash          # skip confirmation on shell commands
+ai-coder chat --allow-all           # auto-approve ALL tool calls, no prompts
 ```
 
 **In-session commands:**
@@ -93,7 +94,11 @@ Allow bash command?
 To skip these prompts in a trusted environment:
 
 ```bash
-ai-coder chat --allow-bash
+ai-coder chat --allow-bash   # skip confirmation for shell commands only
+ai-coder chat --allow-all    # auto-approve ALL tool calls without any prompt
 ```
 
-> Never use `--allow-bash` on untrusted input or in automated pipelines.
+On **Windows**, `run_bash` uses PowerShell (`pwsh` or `powershell`) so that
+Unix-style commands like `mv`, `ls`, and `cp` work out of the box.
+
+> Never use `--allow-all` or `--allow-bash` on untrusted input or in automated pipelines.
