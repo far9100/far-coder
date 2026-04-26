@@ -96,7 +96,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 summary, tags, files_touched, project_path, search_blob,
                 content='memory', content_rowid='rowid',
-                tokenize="unicode61 remove_diacritics 2 tokenchars '_./-'"
+                tokenize="unicode61 remove_diacritics 2 tokenchars '_.-'"
             )
             """
         )
@@ -326,7 +326,9 @@ def load_recent(n: int = 5, project_path: str | None = None) -> list[dict]:
 def _fts_query_for(query: str) -> str:
     """Build a permissive FTS5 MATCH query: each token is OR'd with prefix match."""
     expanded = _split_camel(query)
-    tokens = re.findall(r"[\w./-]+", expanded)
+    # `/` and `\` are separators in our index (path components become individual tokens),
+    # so split the query on those too. `.` and `-` stay inside tokens (filenames, hyphens).
+    tokens = re.findall(r"[\w.-]+", expanded)
     tokens = [t for t in tokens if t]
     if not tokens:
         return ""
