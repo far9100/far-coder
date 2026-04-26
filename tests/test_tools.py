@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 from pathlib import Path
 
@@ -6,7 +8,9 @@ from farcode.tools import (
     _edit_file,
     _list_directory,
     _read_file,
+    _save_memory,
     _search_in_files,
+    execute_tool,
 )
 
 
@@ -137,3 +141,102 @@ def test_create_file_already_exists(tmp_path):
     result = _create_file(str(p), "new content")
     assert result.startswith("Error:")
     assert p.read_text(encoding="utf-8") == "original"
+
+
+# ── read_file with offset/limit ───────────────────────────────────────────────
+
+def test_read_file_with_offset(tmp_path):
+    f = tmp_path / "lines.txt"
+    f.write_text("\n".join(f"line{i}" for i in range(1, 11)), encoding="utf-8")
+    result = _read_file(str(f), offset=3, limit=2)
+    assert "line3" in result
+    assert "line4" in result
+    assert "line5" not in result
+    assert "line1" not in result
+
+
+def test_read_file_limit_only(tmp_path):
+    f = tmp_path / "lines.txt"
+    f.write_text("\n".join(f"line{i}" for i in range(1, 11)), encoding="utf-8")
+    result = _read_file(str(f), limit=3)
+    assert "line1" in result
+    assert "line3" in result
+    assert "line4" not in result
+
+
+def test_read_file_offset_past_end(tmp_path):
+    f = tmp_path / "lines.txt"
+    f.write_text("only_line", encoding="utf-8")
+    result = _read_file(str(f), offset=100, limit=10)
+    # Offset past the last line returns the slice header but no content; just don't crash.
+    assert "Error" not in result
+
+
+def test_read_file_full_no_offset(tmp_path):
+    f = tmp_path / "x.txt"
+    f.write_text("complete contents", encoding="utf-8")
+    assert _read_file(str(f)) == "complete contents"
+
+
+def test_read_file_truncates_huge_file(tmp_path):
+    f = tmp_path / "big.txt"
+    # 200 KB file — exceeds the 50 KB cap
+    f.write_text("x" * 200_000, encoding="utf-8")
+    result = _read_file(str(f))
+    assert "[truncated" in result
+    assert len(result) < 200_000
+
+
+# ── save_memory tool ──────────────────────────────────────────────────────────
+
+@pytest.fixture
+def reset_memory(tmp_path, monkeypatch):
+    """Point memory storage at a temp DB and clean module state."""
+    if "farcode.memory" in sys.modules:
+        del sys.modules["farcode.memory"]
+    import farcode.memory as memory_mod
+    memory_mod.MEMORY_DB = tmp_path / "tools-mem.db"
+    memory_mod.LEGACY_JSONL_PATHS = []
+    memory_mod._conn = None
+    memory_mod._fts_available = None
+    memory_mod._project_cache.clear()
+    monkeypatch.chdir(tmp_path)
+    return memory_mod
+
+
+def test_save_memory_round_trip(reset_memory, tmp_path):
+    result = _save_memory("renamed widget API to use snake_case")
+    assert result.startswith("OK:")
+    entries = reset_memory.load_recent(5)
+    assert len(entries) == 1
+    assert entries[0]["summary"] == "renamed widget API to use snake_case"
+    assert entries[0]["kind"] == "task"
+
+
+def test_save_memory_with_tags_and_files(reset_memory, tmp_path):
+    _save_memory(
+        "fixed flaky test",
+        tags=["tests", "bugfix"],
+        files_touched=["tests/test_a.py"],
+    )
+    entries = reset_memory.load_recent(5)
+    assert entries[0]["tags"] == ["tests", "bugfix"]
+    assert entries[0]["files_touched"] == ["tests/test_a.py"]
+
+
+def test_save_memory_rejects_empty(reset_memory):
+    result = _save_memory("")
+    assert result.startswith("Error:")
+    assert reset_memory.load_recent(5) == []
+
+
+def test_execute_tool_dispatches_save_memory(reset_memory):
+    result = execute_tool("save_memory", {"summary": "via execute_tool"})
+    assert result.startswith("OK:")
+    assert reset_memory.load_recent(5)[0]["summary"] == "via execute_tool"
+
+
+def test_execute_tool_dispatches_recall_memory(reset_memory):
+    _save_memory("the auth refactor is done")
+    result = execute_tool("recall_memory", {"query": "auth", "scope": "all"})
+    assert "auth refactor" in result
