@@ -29,6 +29,17 @@ def _system_prompt(num_ctx: int = DEFAULT_NUM_CTX) -> str:
         "For requests that take 3+ steps, call `task_create` once per step "
         "before starting work, then `task_update` to mark each step "
         "in_progress and completed as you progress.\n\n"
+        "## Exploration\n"
+        "When the user asks 'how does X work', 'where is Y', or 'trace this "
+        "feature' and answering needs reading 5+ files, prefer "
+        "`explore_subagent(question, focus_area?)` over reading the files "
+        "directly — it isolates the investigation in a sub-loop and returns a "
+        "concise summary, keeping this conversation's context clean.\n\n"
+        "## Documentation lookup\n"
+        "If `fetch_doc` is available (only when the user passed `--allow-web`), "
+        "use it to look up package versions, summaries, and licenses on PyPI / "
+        "npm / crates.io / pkg.go.dev rather than guessing. Do NOT call it if "
+        "it returns 'disabled' — that means web access is off.\n\n"
         f"Context window is {ctx_k}K tokens. Keep replies short."
     )
 

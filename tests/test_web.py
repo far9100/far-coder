@@ -16,6 +16,13 @@ def web_disabled_by_default(monkeypatch):
     tools.set_web_enabled(False)
 
 
+@pytest.fixture(autouse=True)
+def isolated_cache(tmp_path, monkeypatch):
+    """Redirect web cache to a per-test tmp file so disk state never leaks."""
+    monkeypatch.setattr(web, "CACHE_PATH", tmp_path / "doc_cache.json")
+    yield
+
+
 # ── Allowlist & input validation ─────────────────────────────────────────────
 
 def test_url_allowlist_accepts_known_hosts():
@@ -234,3 +241,108 @@ def test_fetch_doc_not_in_subagent_tools():
     from farcode import subagent
     names = {s["function"]["name"] for s in subagent.get_subagent_tools()}
     assert "fetch_doc" not in names
+
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+
+def test_fetch_caches_successful_response(mock_httpx):
+    payload = json.dumps({"info": {"name": "httpx", "version": "0.28.1", "summary": "x"}})
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+
+    out1 = web.fetch("httpx", "pypi")
+    assert "cached" not in out1
+    assert "version: 0.28.1" in out1
+
+    # Second call should hit the cache and NOT touch httpx
+    mock_httpx["calls"].clear()
+    mock_httpx["next_response"] = _FakeResponse("SHOULD NOT BE USED", 200, "application/json")
+    out2 = web.fetch("httpx", "pypi")
+    assert "[cached]" in out2
+    assert "version: 0.28.1" in out2
+    assert mock_httpx["calls"] == []  # no new HTTP call
+
+
+def test_fetch_does_not_cache_404(mock_httpx):
+    mock_httpx["next_response"] = _FakeResponse("Not found", 404, "text/plain")
+    web.fetch("nonexistent", "pypi")
+
+    mock_httpx["calls"].clear()
+    mock_httpx["next_response"] = _FakeResponse("Not found", 404, "text/plain")
+    web.fetch("nonexistent", "pypi")
+    # Both calls must hit the network because errors are not cached
+    assert len(mock_httpx["calls"]) == 1
+
+
+def test_fetch_does_not_cache_5xx(mock_httpx):
+    mock_httpx["next_response"] = _FakeResponse("oops", 502, "text/plain")
+    web.fetch("httpx", "pypi")
+
+    mock_httpx["calls"].clear()
+    mock_httpx["next_response"] = _FakeResponse("oops", 502, "text/plain")
+    web.fetch("httpx", "pypi")
+    assert len(mock_httpx["calls"]) == 1
+
+
+def test_fetch_does_not_cache_network_errors(mock_httpx, monkeypatch):
+    import httpx as _httpx
+
+    def boom(*a, **kw):
+        raise _httpx.ConnectError("simulated")
+
+    monkeypatch.setattr(_httpx, "get", boom)
+    out1 = web.fetch("httpx", "pypi")
+    out2 = web.fetch("httpx", "pypi")
+    assert "error" in out1.lower()
+    assert "error" in out2.lower()
+    assert "[cached]" not in out2
+
+
+def test_cache_expires_after_ttl(mock_httpx, monkeypatch):
+    import time as _time
+
+    payload = json.dumps({"info": {"name": "httpx", "version": "1"}})
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+    web.fetch("httpx", "pypi")
+
+    # Advance "time" past the TTL so the cached entry is considered stale
+    real_time = _time.time
+    monkeypatch.setattr(web.time, "time", lambda: real_time() + web.CACHE_TTL_SECONDS + 10)
+
+    mock_httpx["calls"].clear()
+    new_payload = json.dumps({"info": {"name": "httpx", "version": "2"}})
+    mock_httpx["next_response"] = _FakeResponse(new_payload, 200, "application/json")
+    out = web.fetch("httpx", "pypi")
+    assert "version: 2" in out
+    assert "[cached]" not in out
+    assert len(mock_httpx["calls"]) == 1
+
+
+def test_cache_prunes_oldest_when_over_max(mock_httpx, monkeypatch):
+    monkeypatch.setattr(web, "CACHE_MAX_ENTRIES", 3)
+    # Pre-populate cache with 4 stale entries
+    cache = {
+        f"https://pypi.org/pypi/p{i}/json": {"fetched_at": 1000.0 + i, "body": f"v{i}"}
+        for i in range(4)
+    }
+    web._save_cache(cache)
+    saved = web._load_cache()
+    assert len(saved) == 3
+    # Oldest (p0, fetched_at=1000.0) should have been dropped
+    assert "https://pypi.org/pypi/p0/json" not in saved
+    assert "https://pypi.org/pypi/p3/json" in saved
+
+
+def test_cache_corrupted_file_returns_empty(monkeypatch, tmp_path):
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(web, "CACHE_PATH", bad)
+    assert web._load_cache() == {}
+
+
+def test_cached_entry_is_marked_in_output(mock_httpx):
+    payload = json.dumps({"info": {"name": "httpx"}})
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+    web.fetch("httpx", "pypi")
+    out2 = web.fetch("httpx", "pypi")
+    # User-visible marker
+    assert out2.endswith("[cached]")

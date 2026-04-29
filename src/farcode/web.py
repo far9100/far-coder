@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from html.parser import HTMLParser
+from pathlib import Path
 
 MAX_RESPONSE_BYTES = 8192
 TIMEOUT_SECONDS = 10.0
+
+CACHE_PATH = Path.home() / ".farcode_doc_cache.json"
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h
+CACHE_MAX_ENTRIES = 200            # prune LRU-by-fetched_at when over
 
 ECOSYSTEM_REGISTRIES: dict[str, callable] = {
     "python":     lambda pkg: f"https://pypi.org/pypi/{pkg}/json",
@@ -33,7 +39,12 @@ ALLOWED_HOSTS = frozenset({
 
 
 def fetch(query: str, ecosystem: str = "auto") -> str:
-    """Fetch package documentation. Returns trimmed text or an error string."""
+    """Fetch package documentation. Returns trimmed text or an error string.
+
+    Successful responses are cached on disk for ``CACHE_TTL_SECONDS`` so
+    repeat lookups for the same package skip the network entirely. Error
+    responses (4xx / 5xx / network failures) are NOT cached.
+    """
     pkg = (query or "").strip()
     if not pkg:
         return "fetch_doc error: empty query."
@@ -51,6 +62,10 @@ def fetch(query: str, ecosystem: str = "auto") -> str:
     url = builder(pkg)
     if not _url_in_allowlist(url):
         return f"fetch_doc error: URL not in allowlist: {url}"
+
+    cached = _cache_get(url)
+    if cached is not None:
+        return cached + "\n\n[cached]"
 
     try:
         import httpx
@@ -76,6 +91,8 @@ def fetch(query: str, ecosystem: str = "auto") -> str:
 
     if len(body) > MAX_RESPONSE_BYTES:
         body = body[:MAX_RESPONSE_BYTES] + f"\n\n... (truncated at {MAX_RESPONSE_BYTES} chars)"
+
+    _cache_put(url, body)
     return body
 
 
@@ -172,3 +189,46 @@ def _summarize_json(body: str, ecosystem: str) -> str:
 
 def _format_kv(d: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in d.items() if v)
+
+
+# ── Disk cache (24h TTL) ─────────────────────────────────────────────────────
+
+def _load_cache() -> dict:
+    try:
+        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    if len(cache) > CACHE_MAX_ENTRIES:
+        # Drop the oldest entries (lowest fetched_at) to stay under the cap.
+        sorted_items = sorted(cache.items(), key=lambda kv: kv[1].get("fetched_at", 0))
+        cache = dict(sorted_items[-CACHE_MAX_ENTRIES:])
+    try:
+        CACHE_PATH.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _cache_get(url: str) -> str | None:
+    cache = _load_cache()
+    entry = cache.get(url)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at")
+    body = entry.get("body")
+    if not isinstance(fetched_at, (int, float)) or not isinstance(body, str):
+        return None
+    if time.time() - fetched_at > CACHE_TTL_SECONDS:
+        return None
+    return body
+
+
+def _cache_put(url: str, body: str) -> None:
+    cache = _load_cache()
+    cache[url] = {"fetched_at": time.time(), "body": body}
+    _save_cache(cache)

@@ -525,13 +525,25 @@ def _fetch_doc(query: str, ecosystem: str = "auto") -> str:
 
 def _explore_subagent(question: str, focus_area: str | None = None) -> str:
     from . import subagent as _sub
+    from .ui import print_info
     parent_model = _sub.get_parent_model()
     if not parent_model:
         return "Tool error: no parent model bound; cannot start subagent."
+
+    short_q = question.strip()
+    if len(short_q) > 60:
+        short_q = short_q[:57] + "..."
+    suffix = f" [dim](focus: {focus_area})[/]" if focus_area else ""
+    print_info(f"[bold cyan]Subagent[/] exploring: {short_q}{suffix}")
+
     try:
         result, n_calls = _sub.run_subagent(question, focus_area, parent_model)
     except RuntimeError as e:
         return f"Tool error: {e}"
+
+    print_info(
+        f"[bold cyan]Subagent[/] done: {n_calls} tool call(s), {len(result)} chars"
+    )
     header = f"[subagent ran {n_calls} tool call(s)]"
     return f"{header}\n\n{result}"
 

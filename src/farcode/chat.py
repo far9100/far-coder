@@ -437,14 +437,89 @@ def _reindex_code() -> str:
     return f"Indexed {n} code chunk(s)."
 
 
+def _run_explore(question: str, model: str, num_ctx: int, num_predict: int) -> None:
+    """Run a read-only subagent on the user's question and render the answer.
+
+    Used by the ``/explore`` slash command — mirrors the UI shape of an
+    LLM-initiated ``explore_subagent`` tool call but is triggered directly
+    by the user.
+    """
+    q = question.strip()
+    if not q:
+        print_info("Usage: /explore <question>")
+        return
+    short = q[:57] + "..." if len(q) > 60 else q
+    print_info(f"[bold cyan]Subagent[/] exploring: {short}")
+    try:
+        result, n_calls = _subagent.run_subagent(
+            q, focus_area=None, parent_model=model,
+            num_ctx=num_ctx, num_predict=num_predict,
+        )
+    except RuntimeError as e:
+        print_error(str(e))
+        return
+    print_info(
+        f"[bold cyan]Subagent[/] done: {n_calls} tool call(s), {len(result)} chars"
+    )
+    from rich.markdown import Markdown
+    console.print()
+    console.print("[bold cyan]Subagent answer[/]")
+    console.print(Markdown(result))
+    console.print()
+
+
 # ── File / @mention helpers ───────────────────────────────────────────────────
+
+MAX_INLINE_BYTES = 100_000   # 100 KB hard cap on inline file injection
+_BINARY_PROBE_BYTES = 8192    # how much of the head to scan for null bytes
+
+
+def _classify_for_inline(p: Path) -> tuple[str | None, str | None]:
+    """Decide whether ``p`` is safe to inline.
+
+    Returns ``(content, None)`` if inlinable, or ``(None, reason)`` if the
+    file is too large, binary, or unreadable. ``reason`` is a short string
+    fit for printing to the user (e.g. "binary file", "210 KB exceeds 100 KB
+    inline cap").
+    """
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return None, f"unreadable ({e.strerror or e})"
+
+    if size > MAX_INLINE_BYTES:
+        kb = size // 1024
+        cap_kb = MAX_INLINE_BYTES // 1024
+        return None, f"{kb} KB exceeds {cap_kb} KB inline cap"
+
+    try:
+        with p.open("rb") as f:
+            head = f.read(_BINARY_PROBE_BYTES)
+    except OSError as e:
+        return None, f"unreadable ({e.strerror or e})"
+
+    if b"\x00" in head:
+        return None, "binary file"
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return None, f"unreadable ({e.strerror or e})"
+    return content, None
+
 
 def _inject_file(messages: list[dict], path: str) -> bool:
     p = Path(path.strip())
     if not p.exists():
         print_error(f"File not found: {p}")
         return False
-    content = p.read_text(encoding="utf-8", errors="replace")
+    if not p.is_file():
+        print_error(f"Not a file: {p}")
+        return False
+    content, reason = _classify_for_inline(p)
+    if content is None:
+        print_error(f"Cannot inline {p}: {reason}")
+        return False
     messages.append({"role": "user", "content": f"File `{p.name}`:\n\n```\n{content}\n```"})
     messages.append({"role": "assistant", "content": f"Got it, I've loaded `{p.name}`."})
     print_info(f"Loaded {p} ({len(content)} chars)")
@@ -452,31 +527,55 @@ def _inject_file(messages: list[dict], path: str) -> bool:
 
 
 def _expand_at_mentions(text: str) -> tuple[str, list[str], list[str]]:
-    """Expand `@path` mentions in user input.
+    """Expand ``@path`` mentions in user input.
 
-    Returns (expanded_text, hits, misses) where ``hits`` is a list of files
-    that were inlined, and ``misses`` is a list of `@token` strings the user
-    typed that did not resolve to a readable file. The original `@token`
-    text is preserved in place for misses so the model still sees the
-    user's literal request.
+    Returns ``(expanded_text, hits, misses)`` where ``hits`` is a list of
+    files that were inlined, and ``misses`` is a list of human-readable
+    strings explaining why each ``@token`` was *not* inlined (file missing,
+    binary, oversize, etc.). Misses keep their literal ``@token`` text in
+    the message so the model still sees the user's reference.
     """
     found: list[str] = []
     misses: list[str] = []
 
     def _replace(m: re.Match) -> str:
-        token = m.group(1)
-        p = Path(token)
-        if p.exists() and p.is_file():
-            content = p.read_text(encoding="utf-8", errors="replace")
-            found.append(str(p))
-            return f"\n\nFile `{p.name}`:\n```\n{content}\n```\n"
-        misses.append(m.group(0))
-        return m.group(0)
+        token_full = m.group(0)
+        token_path = m.group(1)
+        p = Path(token_path)
+        if not p.exists():
+            misses.append(f"{token_full} (not found)")
+            return token_full
+        if not p.is_file():
+            misses.append(f"{token_full} (not a regular file)")
+            return token_full
+        content, reason = _classify_for_inline(p)
+        if content is None:
+            misses.append(f"{token_full} ({reason})")
+            return token_full
+        found.append(str(p))
+        return f"\n\nFile `{p.name}`:\n```\n{content}\n```\n"
 
     return re.sub(r"@(\S+)", _replace, text), found, misses
 
 
 # ── Parallel tool execution ───────────────────────────────────────────────────
+
+_TASK_MUTATING_TOOLS = frozenset({"task_create", "task_update"})
+
+
+def _maybe_render_tasks(results: list[tuple[str, dict, str]]) -> None:
+    """Render the live task list once after a tool batch that touched tasks.
+
+    Keeps tool handlers UI-free; the dispatcher decides when to surface the
+    updated state. Fires once per batch regardless of how many task_* calls
+    are in it.
+    """
+    if any(name in _TASK_MUTATING_TOOLS for name, _, _ in results):
+        try:
+            print_task_list(_tasks.list_all())
+        except Exception:
+            pass
+
 
 def _run_tools_parallel(tool_calls: list) -> list[tuple[str, dict, str]]:
     """
@@ -489,7 +588,9 @@ def _run_tools_parallel(tool_calls: list) -> list[tuple[str, dict, str]]:
         name, args = tc.function.name, dict(tc.function.arguments)
         result = execute_tool(name, args)
         print_tool_call(name, args, result)
-        return [(name, args, result)]
+        results = [(name, args, result)]
+        _maybe_render_tasks(results)
+        return results
 
     print_info(f"Running [bold]{len(tool_calls)}[/] tools in parallel...")
 
@@ -508,7 +609,9 @@ def _run_tools_parallel(tool_calls: list) -> list[tuple[str, dict, str]]:
             ordered[idx] = (name, args, result)
             print_tool_call(name, args, result)
 
-    return [ordered[i] for i in range(len(tool_calls))]
+    results = [ordered[i] for i in range(len(tool_calls))]
+    _maybe_render_tasks(results)
+    return results
 
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
@@ -716,6 +819,12 @@ def run_chat(
 
         if cmd == "/tasks":
             print_task_list(_tasks.list_all())
+            continue
+
+        if cmd.startswith("/explore"):
+            _wait_idle()
+            question = user_input[len("/explore"):].strip()
+            _run_explore(question, current_model, num_ctx, num_predict)
             continue
 
         if cmd in ("/exit", "/quit"):

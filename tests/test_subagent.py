@@ -249,3 +249,83 @@ def test_explore_subagent_not_listed_in_subagent_tools():
     schemas = subagent.get_subagent_tools()
     names = {s["function"]["name"] for s in schemas}
     assert "explore_subagent" not in names
+
+
+# ── UI hooks: subagent start / done lines ────────────────────────────────────
+
+def test_explore_subagent_handler_prints_start_and_done(monkeypatch):
+    from farcode.tools import _explore_subagent
+    from farcode import ui
+
+    captured: list[str] = []
+    monkeypatch.setattr(ui, "print_info", lambda msg: captured.append(msg))
+    monkeypatch.setattr(subagent, "run_subagent", lambda *a, **kw: ("the answer", 4))
+    subagent.bind_parent_model("parent:7b")
+
+    out = _explore_subagent("trace the auth flow", focus_area="src/auth")
+    assert "the answer" in out
+
+    starts = [m for m in captured if "exploring" in m]
+    dones = [m for m in captured if "done" in m]
+    assert len(starts) == 1
+    assert "trace the auth flow" in starts[0]
+    assert "src/auth" in starts[0]  # focus appended in start line
+    assert len(dones) == 1
+    assert "4 tool call" in dones[0]
+
+
+def test_explore_subagent_handler_truncates_long_question_in_start_line(monkeypatch):
+    from farcode.tools import _explore_subagent
+    from farcode import ui
+
+    captured: list[str] = []
+    monkeypatch.setattr(ui, "print_info", lambda msg: captured.append(msg))
+    monkeypatch.setattr(subagent, "run_subagent", lambda *a, **kw: ("ok", 0))
+    subagent.bind_parent_model("p")
+
+    long_q = "a" * 200
+    _explore_subagent(long_q)
+    starts = [m for m in captured if "exploring" in m]
+    assert "..." in starts[0]
+    assert len(starts[0]) < 200  # not the full 200-char question
+
+
+# ── /explore slash command helper ───────────────────────────────────────────
+
+def test_run_explore_invokes_subagent_with_current_model(monkeypatch):
+    from farcode import chat
+
+    captured = {}
+    monkeypatch.setattr(chat._subagent, "run_subagent",
+                        lambda q, focus_area, parent_model, num_ctx=0, num_predict=0:
+                            (captured.setdefault("call", {"q": q, "model": parent_model}),
+                             ("explored result", 5))[1])
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_error", lambda *a, **kw: None)
+    monkeypatch.setattr(chat.console, "print", lambda *a, **kw: None)
+
+    chat._run_explore("how does X work", model="big-model:7b", num_ctx=8192, num_predict=512)
+    assert captured["call"]["q"] == "how does X work"
+    assert captured["call"]["model"] == "big-model:7b"
+
+
+def test_run_explore_empty_question_prints_usage(monkeypatch):
+    from farcode import chat
+
+    infos: list[str] = []
+    monkeypatch.setattr(chat, "print_info", lambda msg: infos.append(msg))
+    monkeypatch.setattr(chat, "print_error", lambda *a, **kw: None)
+
+    called = {"n": 0}
+    monkeypatch.setattr(chat._subagent, "run_subagent",
+                        lambda *a, **kw: (called.update(n=called["n"] + 1), ("x", 0))[1])
+
+    chat._run_explore("   ", model="m", num_ctx=8192, num_predict=512)
+    assert any("Usage" in m for m in infos)
+    assert called["n"] == 0  # subagent never invoked
+
+
+def test_explore_command_is_in_registry():
+    from farcode.commands import SLASH_COMMANDS
+    names = [n.split()[0] for n, _ in SLASH_COMMANDS]
+    assert "/explore" in names

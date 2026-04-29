@@ -419,6 +419,43 @@ def test_banner_line_includes_help_first():
     assert "/tasks" in line
 
 
+def test_slash_commands_grouped_into_sections():
+    from farcode.commands import SLASH_COMMAND_SECTIONS
+
+    section_names = [name for name, _ in SLASH_COMMAND_SECTIONS]
+    assert "Discovery" in section_names
+    assert "Files & code" in section_names
+    assert "Session" in section_names
+    assert "Config" in section_names
+
+    # /help and /tasks live under Discovery
+    discovery_items = next(items for name, items in SLASH_COMMAND_SECTIONS
+                           if name == "Discovery")
+    discovery_cmds = [c for c, _ in discovery_items]
+    assert "/help" in discovery_cmds
+    assert "/tasks" in discovery_cmds
+
+
+def test_print_help_renders_section_headers(capsys):
+    import io
+    from farcode import ui
+    from rich.console import Console
+
+    buf = io.StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=False, legacy_windows=False)
+    original = ui.console
+    ui.console = test_console
+    try:
+        ui.print_help()
+    finally:
+        ui.console = original
+
+    out = buf.getvalue()
+    # Each section header must appear in the help output
+    for section in ("Discovery", "Files & code", "Session", "Config"):
+        assert section in out, f"section '{section}' missing from /help"
+
+
 def test_print_help_renders_all_registry_entries(capsys):
     import io
     from farcode import ui
@@ -458,7 +495,7 @@ def test_expand_at_mentions_reports_miss(tmp_path, monkeypatch):
     text, found, misses = chat._expand_at_mentions("see @nope.txt for context")
     assert "@nope.txt" in text  # original token preserved
     assert found == []
-    assert "@nope.txt" in misses
+    assert any("@nope.txt" in m and "not found" in m for m in misses)
 
 
 def test_expand_at_mentions_directory_is_not_a_hit(tmp_path, monkeypatch):
@@ -466,7 +503,7 @@ def test_expand_at_mentions_directory_is_not_a_hit(tmp_path, monkeypatch):
     (tmp_path / "subdir").mkdir()
     text, found, misses = chat._expand_at_mentions("read @subdir entirely")
     assert found == []
-    assert "@subdir" in misses
+    assert any("@subdir" in m for m in misses)
 
 
 def test_expand_at_mentions_mixed_hits_and_misses(tmp_path, monkeypatch):
@@ -474,9 +511,62 @@ def test_expand_at_mentions_mixed_hits_and_misses(tmp_path, monkeypatch):
     (tmp_path / "good.txt").write_text("yes", encoding="utf-8")
     text, found, misses = chat._expand_at_mentions("@good.txt and @missing.txt")
     assert any(name.endswith("good.txt") for name in found)
-    assert "@missing.txt" in misses
+    assert any("@missing.txt" in m for m in misses)
     assert "yes" in text
     assert "@missing.txt" in text  # miss token preserved
+
+
+def test_expand_at_mentions_refuses_oversize_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    big = tmp_path / "huge.log"
+    big.write_text("x" * (chat.MAX_INLINE_BYTES + 5000), encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("look at @huge.log")
+    assert found == []
+    assert any("@huge.log" in m and "exceeds" in m for m in misses)
+    assert "@huge.log" in text  # token preserved
+    assert "xxxxx" not in text  # content NOT inlined
+
+
+def test_expand_at_mentions_refuses_binary_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    bin_file = tmp_path / "image.png"
+    bin_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 100)
+    text, found, misses = chat._expand_at_mentions("see @image.png")
+    assert found == []
+    assert any("@image.png" in m and "binary" in m for m in misses)
+
+
+def test_expand_at_mentions_inlines_just_under_cap(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "borderline.txt"
+    f.write_text("y" * (chat.MAX_INLINE_BYTES - 100), encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("@borderline.txt")
+    assert any(name.endswith("borderline.txt") for name in found)
+    assert misses == []
+
+
+def test_inject_file_refuses_binary(tmp_path):
+    bin_file = tmp_path / "blob.bin"
+    bin_file.write_bytes(b"\x00\x01\x02\x03" * 100)
+    msgs: list[dict] = []
+    assert chat._inject_file(msgs, str(bin_file)) is False
+    assert msgs == []
+
+
+def test_inject_file_refuses_oversize(tmp_path):
+    big = tmp_path / "big.log"
+    big.write_text("x" * (chat.MAX_INLINE_BYTES + 1), encoding="utf-8")
+    msgs: list[dict] = []
+    assert chat._inject_file(msgs, str(big)) is False
+    assert msgs == []
+
+
+def test_classify_for_inline_returns_content_for_normal_file(tmp_path):
+    f = tmp_path / "ok.txt"
+    f.write_text("hello", encoding="utf-8")
+    content, reason = chat._classify_for_inline(f)
+    assert content == "hello"
+    assert reason is None
 
 
 def test_at_completer_suggests_files_in_cwd(tmp_path, monkeypatch):

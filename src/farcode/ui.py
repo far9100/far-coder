@@ -10,7 +10,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .client import StreamStats
-from .commands import SLASH_COMMANDS, banner_line
+from .commands import SLASH_COMMAND_SECTIONS, SLASH_COMMANDS, banner_line
 
 # Reconfigure stdout/stderr to UTF-8 on Windows so Rich can emit Unicode
 # spinners and box-drawing characters in any terminal.
@@ -59,15 +59,19 @@ def print_welcome(model: str) -> None:
 
 
 def print_help() -> None:
-    """Render the full slash-command list with one-line descriptions."""
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="bold cyan", no_wrap=True)
-    table.add_column(style="dim")
-    for name, desc in SLASH_COMMANDS:
-        table.add_row(name, desc)
+    """Render slash commands grouped by section with one-line descriptions."""
     console.print()
     console.print("[bold]In-session commands[/]")
-    console.print(table)
+    for idx, (section, items) in enumerate(SLASH_COMMAND_SECTIONS):
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column(style="dim")
+        for name, desc in items:
+            table.add_row(name, desc)
+        if idx > 0:
+            console.print()
+        console.print(f"  [bold dim]{section}[/]")
+        console.print(table)
     console.print()
 
 

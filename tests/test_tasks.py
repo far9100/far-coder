@@ -196,6 +196,80 @@ def test_session_load_tolerates_missing_tasks_field(tmp_path, monkeypatch):
     assert loaded[0].tasks == []
 
 
+# ── auto-render after task tool calls ────────────────────────────────────────
+
+def test_auto_render_fires_on_task_update(monkeypatch):
+    """When _run_tools_parallel handles a task_update call, it should render
+    the live task list once afterwards."""
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall
+
+    rendered: list[list[dict]] = []
+    monkeypatch.setattr(chat, "print_task_list", lambda items: rendered.append(list(items)))
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+
+    tasks.create("step")
+    tid = tasks.list_all()[0]["id"]
+    tc = _SyntheticToolCall("task_update", {"id": tid, "status": "completed"})
+    chat._run_tools_parallel([tc])
+
+    assert len(rendered) == 1
+    assert rendered[0][0]["status"] == "completed"
+
+
+def test_auto_render_fires_on_task_create(monkeypatch):
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall
+
+    rendered: list[list[dict]] = []
+    monkeypatch.setattr(chat, "print_task_list", lambda items: rendered.append(list(items)))
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+
+    tc = _SyntheticToolCall("task_create", {"content": "step one"})
+    chat._run_tools_parallel([tc])
+
+    assert len(rendered) == 1
+    assert rendered[0][0]["content"] == "step one"
+
+
+def test_auto_render_does_not_fire_on_unrelated_tool(monkeypatch):
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall
+
+    rendered: list[list[dict]] = []
+    monkeypatch.setattr(chat, "print_task_list", lambda items: rendered.append(list(items)))
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+
+    tc = _SyntheticToolCall("task_list", {})  # task_list is read-only, not mutating
+    chat._run_tools_parallel([tc])
+
+    assert rendered == []
+
+
+def test_auto_render_fires_once_per_batch(monkeypatch):
+    """Multiple task_create calls in one batch should render only once."""
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall
+
+    rendered: list[list[dict]] = []
+    monkeypatch.setattr(chat, "print_task_list", lambda items: rendered.append(list(items)))
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+
+    calls = [
+        _SyntheticToolCall("task_create", {"content": "a"}),
+        _SyntheticToolCall("task_create", {"content": "b"}),
+        _SyntheticToolCall("task_create", {"content": "c"}),
+    ]
+    chat._run_tools_parallel(calls)
+
+    assert len(rendered) == 1
+    assert len(rendered[0]) == 3  # all three tasks visible in the single render
+
+
 def test_session_load_filters_malformed_tasks(tmp_path, monkeypatch):
     import json
     from farcode import sessions
