@@ -387,3 +387,183 @@ def test_reindex_code_with_no_files_returns_zero(tmp_path, monkeypatch):
 
     out = chat._reindex_code()
     assert "Indexed 0" in out
+
+
+# ── /help + slash command registry ───────────────────────────────────────────
+
+def test_slash_commands_registry_contains_core_commands():
+    from farcode.commands import SLASH_COMMANDS
+
+    names = [name for name, _ in SLASH_COMMANDS]
+    flat = " ".join(names)
+    for required in ("/help", "/exit", "/clear", "/file", "/model",
+                     "/compact", "/rules", "/undo", "/diff", "/reindex",
+                     "/resume", "/tasks"):
+        assert required in flat, f"missing {required} in registry"
+
+
+def test_slash_commands_registry_descriptions_nonempty():
+    from farcode.commands import SLASH_COMMANDS
+
+    for name, desc in SLASH_COMMANDS:
+        assert name and isinstance(name, str)
+        assert desc and isinstance(desc, str)
+
+
+def test_banner_line_includes_help_first():
+    from farcode.commands import banner_line
+
+    line = banner_line()
+    assert line.startswith("/help")
+    assert "/exit" in line
+    assert "/tasks" in line
+
+
+def test_print_help_renders_all_registry_entries(capsys):
+    import io
+    from farcode import ui
+    from farcode.commands import SLASH_COMMANDS
+    from rich.console import Console
+
+    buf = io.StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=False, legacy_windows=False)
+    original = ui.console
+    ui.console = test_console
+    try:
+        ui.print_help()
+    finally:
+        ui.console = original
+
+    out = buf.getvalue()
+    for name, desc in SLASH_COMMANDS:
+        # The first token of the name (handles "/exit  /quit" entries).
+        first = name.split()[0]
+        assert first in out, f"{first} missing from /help output"
+
+
+# ── _expand_at_mentions / @completion ────────────────────────────────────────
+
+def test_expand_at_mentions_inlines_existing_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "hello.txt"
+    f.write_text("greetings", encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("look at @hello.txt please")
+    assert "greetings" in text
+    assert any(name.endswith("hello.txt") for name in found)
+    assert misses == []
+
+
+def test_expand_at_mentions_reports_miss(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    text, found, misses = chat._expand_at_mentions("see @nope.txt for context")
+    assert "@nope.txt" in text  # original token preserved
+    assert found == []
+    assert "@nope.txt" in misses
+
+
+def test_expand_at_mentions_directory_is_not_a_hit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "subdir").mkdir()
+    text, found, misses = chat._expand_at_mentions("read @subdir entirely")
+    assert found == []
+    assert "@subdir" in misses
+
+
+def test_expand_at_mentions_mixed_hits_and_misses(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "good.txt").write_text("yes", encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("@good.txt and @missing.txt")
+    assert any(name.endswith("good.txt") for name in found)
+    assert "@missing.txt" in misses
+    assert "yes" in text
+    assert "@missing.txt" in text  # miss token preserved
+
+
+def test_at_completer_suggests_files_in_cwd(tmp_path, monkeypatch):
+    from prompt_toolkit.document import Document
+    from farcode.completion import AtFileCompleter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "alpha.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "beta.txt").write_text("b", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+
+    comp = AtFileCompleter()
+    doc = Document("look at @al")
+    suggestions = list(comp.get_completions(doc, complete_event=None))
+    displays = [str(s.display) for s in suggestions]
+    # Display strings are FormattedText objects; coerce via str()
+    flat = " ".join(displays)
+    assert "alpha.txt" in flat
+    assert "beta.txt" not in flat  # filtered by 'al' prefix
+
+
+def test_at_completer_no_suggestions_without_at(tmp_path, monkeypatch):
+    from prompt_toolkit.document import Document
+    from farcode.completion import AtFileCompleter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "alpha.txt").write_text("a", encoding="utf-8")
+
+    comp = AtFileCompleter()
+    doc = Document("just text al")
+    suggestions = list(comp.get_completions(doc, complete_event=None))
+    assert suggestions == []
+
+
+def test_at_completer_lists_subdirectory(tmp_path, monkeypatch):
+    from prompt_toolkit.document import Document
+    from farcode.completion import AtFileCompleter
+
+    monkeypatch.chdir(tmp_path)
+    sub = tmp_path / "src"
+    sub.mkdir()
+    (sub / "main.py").write_text("x", encoding="utf-8")
+    (sub / "util.py").write_text("y", encoding="utf-8")
+
+    comp = AtFileCompleter()
+    doc = Document("@src/")
+    suggestions = list(comp.get_completions(doc, complete_event=None))
+    flat = " ".join(str(s.display) for s in suggestions)
+    assert "main.py" in flat
+    assert "util.py" in flat
+
+
+def test_at_completer_skips_hidden_unless_typed(tmp_path, monkeypatch):
+    from prompt_toolkit.document import Document
+    from farcode.completion import AtFileCompleter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".secret").write_text("s", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("v", encoding="utf-8")
+
+    comp = AtFileCompleter()
+    plain_suggestions = list(comp.get_completions(Document("@"), None))
+    plain_flat = " ".join(str(s.display) for s in plain_suggestions)
+    assert "visible.txt" in plain_flat
+    assert ".secret" not in plain_flat
+
+    dot_suggestions = list(comp.get_completions(Document("@."), None))
+    dot_flat = " ".join(str(s.display) for s in dot_suggestions)
+    assert ".secret" in dot_flat
+
+
+def test_print_welcome_uses_registry(capsys):
+    import io
+    from farcode import ui
+    from rich.console import Console
+
+    buf = io.StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=False, legacy_windows=False)
+    original = ui.console
+    ui.console = test_console
+    try:
+        ui.print_welcome("test-model")
+    finally:
+        ui.console = original
+
+    out = buf.getvalue()
+    assert "test-model" in out
+    # Banner must include /help (the registry-driven part)
+    assert "/help" in out
+    assert "/tasks" in out

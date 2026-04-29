@@ -14,6 +14,10 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
+from . import subagent as _subagent
+from . import tasks as _tasks
+from .completion import AtFileCompleter
+
 from .client import (
     DEFAULT_NUM_CTX,
     DEFAULT_NUM_PREDICT,
@@ -38,7 +42,9 @@ from .ui import (
     call_with_thinking,
     console,
     print_error,
+    print_help,
     print_info,
+    print_task_list,
     print_tool_call,
     print_welcome,
     render_response,
@@ -242,6 +248,8 @@ def _make_prompt_session() -> PromptSession:
         multiline=True,
         history=FileHistory(str(_HISTORY_FILE)),
         bottom_toolbar=_bottom_toolbar,
+        completer=AtFileCompleter(),
+        complete_while_typing=True,
     )
 
 
@@ -443,18 +451,29 @@ def _inject_file(messages: list[dict], path: str) -> bool:
     return True
 
 
-def _expand_at_mentions(text: str) -> tuple[str, list[str]]:
+def _expand_at_mentions(text: str) -> tuple[str, list[str], list[str]]:
+    """Expand `@path` mentions in user input.
+
+    Returns (expanded_text, hits, misses) where ``hits`` is a list of files
+    that were inlined, and ``misses`` is a list of `@token` strings the user
+    typed that did not resolve to a readable file. The original `@token`
+    text is preserved in place for misses so the model still sees the
+    user's literal request.
+    """
     found: list[str] = []
+    misses: list[str] = []
 
     def _replace(m: re.Match) -> str:
-        p = Path(m.group(1))
+        token = m.group(1)
+        p = Path(token)
         if p.exists() and p.is_file():
             content = p.read_text(encoding="utf-8", errors="replace")
             found.append(str(p))
             return f"\n\nFile `{p.name}`:\n```\n{content}\n```\n"
+        misses.append(m.group(0))
         return m.group(0)
 
-    return re.sub(r"@(\S+)", _replace, text), found
+    return re.sub(r"@(\S+)", _replace, text), found, misses
 
 
 # ── Parallel tool execution ───────────────────────────────────────────────────
@@ -599,11 +618,15 @@ def run_chat(
     current_session: Session | None = None
     messages = build_system_messages(num_ctx=num_ctx)
     first_user_seen = False
+    _tasks.bind([])  # interim list until a Session is created (lazy)
+    _subagent.bind_parent_model(current_model)
 
     if resume_session is not None:
         _restore_session(resume_session, messages, num_ctx)
         current_model = resume_session.model
         current_session = resume_session
+        _tasks.bind(current_session.tasks)
+        _subagent.bind_parent_model(current_model)
         first_user_seen = True
         compacted = _auto_compact(messages, current_model, num_ctx, num_predict)
         if compacted is not messages:
@@ -648,6 +671,7 @@ def run_chat(
             _run_agent_turn(messages, model_snap, num_ctx, num_predict)
             if current_session is None:
                 current_session = new_session(model_snap)
+                _tasks.move_into(current_session.tasks)
             current_session.messages = list(messages)
             current_session.model = model_snap
             save_session(current_session)
@@ -686,6 +710,14 @@ def run_chat(
 
         # ── Slash commands ────────────────────────────────────────────────────
 
+        if cmd == "/help":
+            print_help()
+            continue
+
+        if cmd == "/tasks":
+            print_task_list(_tasks.list_all())
+            continue
+
         if cmd in ("/exit", "/quit"):
             _wait_idle()
             if current_session is not None:
@@ -700,6 +732,7 @@ def run_chat(
             messages = build_system_messages(num_ctx=num_ctx)
             current_session = None
             first_user_seen = False
+            _tasks.bind([])  # fresh task list for the new session
             print_info("Conversation cleared. Starting new session.")
             continue
 
@@ -714,6 +747,7 @@ def run_chat(
                 current_model = parts[1].strip()
                 if current_session is not None:
                     current_session.model = current_model
+                _subagent.bind_parent_model(current_model)
                 print_info(f"Model: [bold yellow]{current_model}[/]")
             else:
                 print_info(f"Current model: [bold yellow]{current_model}[/]")
@@ -774,6 +808,8 @@ def run_chat(
                 _restore_session(chosen, messages, num_ctx)
                 current_model = chosen.model
                 current_session = chosen
+                _tasks.bind(current_session.tasks)
+                _subagent.bind_parent_model(current_model)
                 first_user_seen = True
                 compacted = _auto_compact(
                     messages, current_model, num_ctx, num_predict
@@ -789,9 +825,13 @@ def run_chat(
 
         # ── Normal message ────────────────────────────────────────────────────
 
-        expanded, found = _expand_at_mentions(user_input)
+        expanded, found, misses = _expand_at_mentions(user_input)
         if found:
             print_info(f"Attached: {', '.join(found)}")
+        if misses:
+            print_info(
+                f"Did not resolve as file (left as text): {', '.join(misses)}"
+            )
 
         # On the first real user message, swap in a query-aware system prompt
         # so memory recall surfaces project-relevant past work.
@@ -811,6 +851,7 @@ def run_chat(
         if not background:
             if current_session is None:
                 current_session = new_session(current_model)
+                _tasks.move_into(current_session.tasks)
             current_session.messages = list(messages)
             current_session.model = current_model
             save_session(current_session)

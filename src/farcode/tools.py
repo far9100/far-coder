@@ -26,6 +26,25 @@ def bash_require_confirm() -> bool:
     return _bash_require_confirm
 
 
+# ── Web access (opt-in) ──────────────────────────────────────────────────────
+
+_web_enabled: bool = False
+
+
+def set_web_enabled(val: bool) -> None:
+    """Toggle the fetch_doc tool. Call with True via --allow-web."""
+    global _web_enabled
+    _web_enabled = val
+
+
+def web_enabled() -> bool:
+    """True if fetch_doc is allowed (via flag or FARCODE_ALLOW_WEB env var)."""
+    if _web_enabled:
+        return True
+    val = os.environ.get("FARCODE_ALLOW_WEB", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 # ── Per-turn tool-call cap ────────────────────────────────────────────────────
 
 def max_tools_per_turn() -> int:
@@ -312,6 +331,122 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_create",
+            "description": (
+                "Create a pending task in the user's visible to-do list. Use this at the "
+                "start of a multi-step request (3+ steps) to make the plan visible. "
+                "Returns the new task's short id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Short imperative description of one step",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": (
+                "Update a task's status. Mark in_progress when you start a step and "
+                "completed when it is finished. Status must be one of: pending, "
+                "in_progress, completed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Task id returned by task_create",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed"],
+                        "description": "New status",
+                    },
+                },
+                "required": ["id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": (
+                "List all current tasks with their status. Useful to re-orient mid-task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_doc",
+            "description": (
+                "Fetch package documentation from an allow-listed registry "
+                "(PyPI, npm, crates.io, pkg.go.dev). Returns version, summary, "
+                "license, and homepage. DISABLED by default — requires --allow-web "
+                "or FARCODE_ALLOW_WEB=1; do not call without confirming it is enabled."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Package name (e.g. 'httpx', 'react', 'serde')",
+                    },
+                    "ecosystem": {
+                        "type": "string",
+                        "enum": ["auto", "pypi", "python", "npm", "javascript", "rust", "go"],
+                        "description": "Which registry to query. 'auto' defaults to pypi.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explore_subagent",
+            "description": (
+                "Delegate a focused investigation to a read-only sub-agent. The sub-agent "
+                "has its own message history (no parent context) and access only to "
+                "read_file, list_directory, search_in_files, recall_code, and recall_memory. "
+                "It returns a concise factual summary, keeping intermediate tool chatter "
+                "out of this conversation. Use for: tracing a feature across many files, "
+                "answering 'how does X work', or surveying patterns. Cannot itself call "
+                "explore_subagent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The exact question for the subagent to answer",
+                    },
+                    "focus_area": {
+                        "type": "string",
+                        "description": "Optional: file/directory/module the subagent should anchor on",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 
@@ -328,6 +463,11 @@ def execute_tool(name: str, arguments: dict) -> str:
         "recall_memory": _recall_memory,
         "recall_code": _recall_code,
         "save_memory": _save_memory,
+        "task_create": _task_create,
+        "task_update": _task_update,
+        "task_list": _task_list,
+        "explore_subagent": _explore_subagent,
+        "fetch_doc": _fetch_doc,
     }
     handler = handlers.get(name)
     if not handler:
@@ -338,6 +478,62 @@ def execute_tool(name: str, arguments: dict) -> str:
         return f"Tool call error (bad arguments): {e}"
     except Exception as e:
         return f"Tool error: {e}"
+
+
+# ── Task tracking handlers ───────────────────────────────────────────────────
+
+_STATUS_ICON = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+
+
+def _task_create(content: str) -> str:
+    from . import tasks as _tasks
+    task = _tasks.create(content)
+    return f"Created task {task['id']}: {task['content']}"
+
+
+def _task_update(id: str, status: str) -> str:
+    from . import tasks as _tasks
+    task = _tasks.update(id, status)
+    return f"Task {task['id']} -> {task['status']}: {task['content']}"
+
+
+def _task_list() -> str:
+    from . import tasks as _tasks
+    items = _tasks.list_all()
+    if not items:
+        return "No tasks."
+    lines = []
+    for t in items:
+        icon = _STATUS_ICON.get(t.get("status", ""), "[?]")
+        lines.append(f"{icon} {t['id']}: {t['content']}")
+    return "\n".join(lines)
+
+
+# ── Web fetch handler ────────────────────────────────────────────────────────
+
+def _fetch_doc(query: str, ecosystem: str = "auto") -> str:
+    if not web_enabled():
+        return (
+            "Tool error: fetch_doc is disabled. Pass --allow-web at startup "
+            "or set FARCODE_ALLOW_WEB=1 to enable scoped doc lookups."
+        )
+    from . import web
+    return web.fetch(query, ecosystem)
+
+
+# ── Subagent handler ─────────────────────────────────────────────────────────
+
+def _explore_subagent(question: str, focus_area: str | None = None) -> str:
+    from . import subagent as _sub
+    parent_model = _sub.get_parent_model()
+    if not parent_model:
+        return "Tool error: no parent model bound; cannot start subagent."
+    try:
+        result, n_calls = _sub.run_subagent(question, focus_area, parent_model)
+    except RuntimeError as e:
+        return f"Tool error: {e}"
+    header = f"[subagent ran {n_calls} tool call(s)]"
+    return f"{header}\n\n{result}"
 
 
 # ── Post-edit syntax check ────────────────────────────────────────────────────

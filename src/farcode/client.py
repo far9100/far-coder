@@ -25,6 +25,10 @@ def _system_prompt(num_ctx: int = DEFAULT_NUM_CTX) -> str:
         "- `edit_file` — small targeted string replace (1–5 lines)\n"
         "- `replace_lines` — multi-line block change when you know the line range\n"
         "- `write_file` — full rewrite, or when other edits keep failing\n\n"
+        "## Tasks\n"
+        "For requests that take 3+ steps, call `task_create` once per step "
+        "before starting work, then `task_update` to mark each step "
+        "in_progress and completed as you progress.\n\n"
         f"Context window is {ctx_k}K tokens. Keep replies short."
     )
 
@@ -347,6 +351,45 @@ def build_system_messages(
         pass
 
     return [{"role": "system", "content": "\n\n".join(parts)}]
+
+
+def build_subagent_system_message(num_ctx: int = DEFAULT_NUM_CTX) -> dict:
+    """Build a focused system prompt for a read-only exploration subagent.
+
+    Includes codebase facts and the repo map (lightweight project context)
+    but deliberately omits CODER.md project rules and memory recall, so the
+    subagent stays anchored on the immediate question.
+    """
+    ctx_k = max(1, num_ctx // 1024)
+    parts: list[str] = [
+        "You are a read-only exploration subagent. Use the provided tools "
+        "(read_file, list_directory, search_in_files, recall_code, recall_memory) "
+        "to investigate the user's question and return a concise factual summary.\n\n"
+        "## Rules\n"
+        "- Do not propose changes, refactors, or fixes — only describe what exists.\n"
+        "- Cite exact file paths and line numbers where possible.\n"
+        "- Stop once you have enough to answer; do not over-explore.\n"
+        "- Keep the final answer under 600 words.\n\n"
+        f"Context window is {ctx_k}K tokens."
+    ]
+
+    try:
+        from .facts import get_or_build_facts
+        facts = get_or_build_facts()
+        if facts:
+            parts.append(facts)
+    except Exception:
+        pass
+
+    try:
+        from .repomap import build_repo_map
+        repo = build_repo_map()
+        if repo:
+            parts.append(repo)
+    except Exception:
+        pass
+
+    return {"role": "system", "content": "\n\n".join(parts)}
 
 
 def check_ollama(model: str, num_ctx: int = DEFAULT_NUM_CTX) -> None:

@@ -44,6 +44,7 @@ def _default(ctx: typer.Context) -> None:
             background=False,
             allow_bash=False,
             allow_all=False,
+            allow_web=False,
             num_ctx=DEFAULT_NUM_CTX,
             max_output=DEFAULT_NUM_PREDICT,
         )
@@ -174,6 +175,10 @@ def chat(
         bool,
         typer.Option("--allow-all", help="Auto-approve ALL tool calls without any confirmation prompt"),
     ] = False,
+    allow_web: Annotated[
+        bool,
+        typer.Option("--allow-web", help="Enable scoped fetch_doc tool (PyPI/npm/crates/pkg.go.dev only)"),
+    ] = False,
     num_ctx: Annotated[
         int,
         typer.Option("--ctx", help="Context window size in tokens (overrides FARCODE_NUM_CTX)"),
@@ -197,6 +202,10 @@ def chat(
     if allow_all or allow_bash:
         from .tools import set_bash_require_confirm
         set_bash_require_confirm(False)
+
+    if allow_web:
+        from .tools import set_web_enabled
+        set_web_enabled(True)
 
     run_chat(
         model=model,

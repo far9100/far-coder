@@ -5,6 +5,7 @@ description = "Local AI coding assistant CLI powered by Ollama"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.27",
     "ollama>=0.6.1",
     "prompt-toolkit>=3.0.52",
     "rich>=15.0.0",

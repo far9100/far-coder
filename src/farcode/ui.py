@@ -6,9 +6,11 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.spinner import Spinner
+from rich.table import Table
 from rich.text import Text
 
 from .client import StreamStats
+from .commands import SLASH_COMMANDS, banner_line
 
 # Reconfigure stdout/stderr to UTF-8 on Windows so Rich can emit Unicode
 # spinners and box-drawing characters in any terminal.
@@ -51,9 +53,48 @@ def print_welcome(model: str) -> None:
         "[dim]Enter[/] send  [dim]Alt+Enter[/] newline  "
         "[dim]↑↓[/] history  [dim]@file[/] attach  "
         "[dim]Shift+Tab[/] toggle auto-approve\n"
-        "[dim]/clear  /compact  /file <path>  /model [name]  /resume  /rules  "
-        "/diff  /undo  /reindex  /exit[/]"
+        f"[dim]{banner_line()}[/]"
     )
+    console.print()
+
+
+def print_help() -> None:
+    """Render the full slash-command list with one-line descriptions."""
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column(style="dim")
+    for name, desc in SLASH_COMMANDS:
+        table.add_row(name, desc)
+    console.print()
+    console.print("[bold]In-session commands[/]")
+    console.print(table)
+    console.print()
+
+
+_TASK_ICON = {"pending": "○", "in_progress": "→", "completed": "✓"}
+_TASK_STYLE = {"pending": "dim", "in_progress": "bold yellow", "completed": "bold green"}
+
+
+def print_task_list(tasks: list[dict]) -> None:
+    """Render the in-session task list as a Rich table."""
+    if not tasks:
+        console.print("[dim]No tasks.[/]")
+        return
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(no_wrap=True)
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column(overflow="fold")
+    for t in tasks:
+        status = t.get("status", "pending")
+        icon = _TASK_ICON.get(status, "?")
+        style = _TASK_STYLE.get(status, "dim")
+        content = t.get("content", "")
+        if status == "completed":
+            content = f"[strike dim]{content}[/]"
+        table.add_row(f"[{style}]{icon}[/]", t.get("id", ""), content)
+    console.print()
+    console.print("[bold]Tasks[/]")
+    console.print(table)
     console.print()
 
 

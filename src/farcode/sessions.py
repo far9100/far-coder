@@ -8,7 +8,7 @@ message history along with metadata (title, model, timestamps).
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +23,7 @@ class Session:
     created_at: str
     updated_at: str
     messages: list  # list[dict] — always plain dicts, never Ollama objects
+    tasks: list = field(default_factory=list)  # list[dict] — in-session todo items
 
     @property
     def path(self) -> Path:
@@ -87,7 +88,7 @@ def new_session(model: str) -> Session:
     now = datetime.now()
     sid = now.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
     ts = now.isoformat(timespec="seconds")
-    return Session(id=sid, title="(new)", model=model, created_at=ts, updated_at=ts, messages=[])
+    return Session(id=sid, title="(new)", model=model, created_at=ts, updated_at=ts, messages=[], tasks=[])
 
 
 def save_session(session: Session) -> None:
@@ -104,6 +105,7 @@ def save_session(session: Session) -> None:
                 "created_at": session.created_at,
                 "updated_at": session.updated_at,
                 "messages": session.messages,
+                "tasks": session.tasks,
             },
             ensure_ascii=False,
             indent=2,
@@ -126,10 +128,34 @@ def load_sessions(limit: int = 20) -> list[Session]:
             data = json.loads(f.read_text(encoding="utf-8"))
             raw_messages = data.get("messages", [])
             data["messages"] = _validate_messages(raw_messages) if isinstance(raw_messages, list) else []
+            raw_tasks = data.get("tasks", [])
+            data["tasks"] = _validate_tasks(raw_tasks) if isinstance(raw_tasks, list) else []
             result.append(Session(**data))
         except Exception:
             pass
     return result
+
+
+def _validate_tasks(raw: list) -> list[dict]:
+    """Drop malformed task entries from a JSON-decoded tasks list."""
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        tid = entry.get("id")
+        content = entry.get("content")
+        status = entry.get("status")
+        if not isinstance(tid, str) or not isinstance(content, str):
+            continue
+        if status not in ("pending", "in_progress", "completed"):
+            status = "pending"
+        out.append({
+            "id": tid,
+            "content": content,
+            "status": status,
+            "created_at": entry.get("created_at") or "",
+        })
+    return out
 
 
 def load_last_session() -> Session | None:

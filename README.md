@@ -33,22 +33,27 @@ farcode chat -f src/main.py        # pre-load a file
 farcode chat -b                    # background mode (type while AI works)
 farcode chat --allow-bash          # skip confirmation on shell commands
 farcode chat --allow-all           # auto-approve ALL tool calls, no prompts
+farcode chat --allow-web           # enable scoped fetch_doc tool (PyPI/npm/crates/pkg.go.dev)
 ```
 
-**In-session commands:**
+**In-session commands** — type `/help` at any time for the live list:
 
 | Command | Description |
 |---------|-------------|
-| `/clear` | Start a new session |
-| `/compact` | Force-summarize older turns to free context |
+| `/help` | List all slash commands |
+| `/exit` or `/quit` | Save summary and exit |
+| `/clear` | Wipe conversation, start a new session |
 | `/file <path>` | Inject a file into the conversation |
-| `/model <name>` | Switch model mid-session |
-| `/resume` | Pick a saved session to resume |
+| `/model [name]` | Get or set the current model |
+| `/compact` | Force-summarize older turns to free context |
 | `/rules` | Show the currently-loaded `CODER.md` rules |
-| `/diff` | Show the working-tree git diff |
 | `/undo` | Revert the last file write made by the AI |
+| `/diff` | Show the working-tree git diff |
 | `/reindex` | Force-rebuild the code-chunk embedding index |
-| `/exit` or `/quit` | Exit chat |
+| `/resume` | Pick a saved session to resume |
+| `/tasks` | Show the in-session task list (see [Tasks](#in-session-tasks)) |
+
+**Attaching files inline** — type `@path/to/file` anywhere in your message to inline its contents (the prompt offers tab completion after `@`). If a path doesn't resolve, farcode prints a warning and leaves the `@token` as plain text.
 
 ### `review` — Code review
 
@@ -90,10 +95,64 @@ During `chat`, the AI can use these tools autonomously:
 | `recall_code(query, top_k?)` | Semantic + keyword search over code chunks (needs `nomic-embed-text`) |
 | `recall_memory(query, scope?)` | Search past session memories (BM25 over FTS5) |
 | `save_memory(summary, tags?, files_touched?)` | Persist a lesson for future sessions |
+| `task_create(content)` | Create a pending task in the in-session todo list |
+| `task_update(id, status)` | Mark a task `pending` / `in_progress` / `completed` |
+| `task_list()` | List all current tasks with status |
+| `explore_subagent(question, focus_area?)` | Delegate a focused investigation to a read-only sub-agent |
+| `fetch_doc(query, ecosystem?)` | Look up package metadata on PyPI/npm/crates.io/pkg.go.dev (requires `--allow-web`) |
 
 After every file write, farcode runs a per-language **syntax check** (Python `ast`,
 `json.loads`, optional `node --check` / `tsc --noEmit`) and appends the result to
 the tool output, so the model sees errors and can self-correct on the next turn.
+
+### In-session tasks
+
+For requests that take 3+ steps, the model is encouraged to call `task_create`
+up front and `task_update` as it progresses, giving you a visible plan. Type
+`/tasks` to see the current list at any time:
+
+```
+○ a3f2c1: read auth.py
+→ b8e102: extract login flow
+✓ c0d1f4: write integration test
+```
+
+Tasks live on `Session.tasks` and are persisted to disk with the rest of the
+session, so they survive `/resume`.
+
+### Read-only sub-agents
+
+`explore_subagent` runs an isolated agent loop with its own message history
+and only the read-only tools (`read_file`, `list_directory`, `search_in_files`,
+`recall_code`, `recall_memory`). It returns a single text summary back to the
+parent agent, so noisy investigation chatter never pollutes the main
+conversation. Use it for "trace this feature across many files" or "how does X
+work" questions.
+
+Constraints (enforced):
+
+- Cannot itself call `explore_subagent` (depth cap = 1).
+- Cannot mutate state — write/edit/replace/create/run_bash/save_memory are
+  refused at execution time.
+- Capped at 8 tool calls per sub-agent run before being forced to return.
+- Set `FARCODE_SUBAGENT_MODEL` to use a smaller/cheaper model for exploration
+  while the main agent keeps its larger model.
+
+### Web access (opt-in)
+
+`fetch_doc` is **disabled by default** to preserve the local-first stance. When
+enabled with `--allow-web` (or `FARCODE_ALLOW_WEB=1`), it can fetch package
+metadata from a hard-coded allowlist:
+
+- **PyPI** — `pypi.org/pypi/<pkg>/json`
+- **npm** — `registry.npmjs.org/<pkg>`
+- **crates.io** — `crates.io/api/v1/crates/<pkg>`
+- **pkg.go.dev** — `pkg.go.dev/<module>`
+
+JSON registry responses are summarized to name/version/license/homepage; HTML
+pages are stripped of script/style/nav/footer. All responses are capped at
+8 KB. Package names are validated to reject path-traversal and shell
+metacharacters. No general URL fetch is supported; no search-engine integration.
 
 ## Context the AI sees
 
@@ -134,8 +193,10 @@ Farcode includes several mitigations:
 | `FARCODE_NUM_CTX` | `65536` | Ollama context window in tokens |
 | `FARCODE_NUM_PREDICT` | `4096` | Max output tokens reserved per turn |
 | `FARCODE_MAX_TOOLS_PER_TURN` | `1` | Cap on tool calls per turn (0 = unlimited) |
-| `FARCODE_SUMMARY_MODEL` | (unset) | Use a smaller model for compaction/summary |
+| `FARCODE_SUMMARY_MODEL` | (unset) | Smaller model for compaction/summary |
+| `FARCODE_SUBAGENT_MODEL` | (unset) | Smaller model for `explore_subagent` runs |
 | `FARCODE_EMBED_MODEL` | `nomic-embed-text` | Embedding model for `recall_code` |
+| `FARCODE_ALLOW_WEB` | `0` | Set to `1` to enable `fetch_doc` without the CLI flag |
 
 ## Project rules: `CODER.md`
 
