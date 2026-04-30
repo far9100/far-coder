@@ -54,7 +54,7 @@ farcode chat --allow-web           # enable scoped fetch_doc tool (PyPI/npm/crat
 | `/tasks` | Show the in-session task list (see [Tasks](#in-session-tasks)) |
 | `/explore <q>` | Run a [read-only sub-agent](#read-only-sub-agents) on a question, without going through the main agent |
 
-**Attaching files inline** — type `@path/to/file` anywhere in your message to inline its contents. The prompt offers tab completion after `@`. Files larger than 100 KB or detected as binary (null bytes in the first 8 KB) are skipped with a printed reason; misses also report a reason ("not found", "not a regular file", "binary file", etc.) instead of being silently dropped.
+**Attaching files inline** — type `@path/to/file` anywhere in your message to inline its contents. The prompt offers tab completion after `@`. Append a line range to inject only part of a file: `@chat.py:50-100` (lines 50-100 inclusive), `@chat.py:50` (just line 50), `@chat.py:50-` (line 50 through EOF). Line ranges bypass the whole-file size cap. Files larger than 100 KB or detected as binary (null bytes in the first 8 KB) are skipped with a printed reason; misses also report a reason ("not found", "not a regular file", "binary file", etc.) instead of being silently dropped.
 
 ### `review` — Code review
 
@@ -145,16 +145,26 @@ When a sub-agent runs you'll see live `Subagent exploring: ...` and `Subagent
 done: N tool call(s), X chars` lines so the wait is never silent. You can also
 trigger one directly with `/explore <question>` (skips the main agent).
 
+`explore_subagent` is **exempt from `FARCODE_MAX_TOOLS_PER_TURN`** — when the
+main agent emits multiple subagent calls in one turn, they all run in parallel
+(via the existing tool ThreadPoolExecutor). Successful subagent results are
+cached in-memory keyed by `(question, focus_area)` for the current chat
+session; cached returns are tagged `[cached]`. The cache is dropped on
+`/clear` and `/resume`.
+
 ### Web access (opt-in)
 
 `fetch_doc` is **disabled by default** to preserve the local-first stance. When
 enabled with `--allow-web` (or `FARCODE_ALLOW_WEB=1`), it can fetch package
 metadata from a hard-coded allowlist:
 
-- **PyPI** — `pypi.org/pypi/<pkg>/json`
-- **npm** — `registry.npmjs.org/<pkg>`
-- **crates.io** — `crates.io/api/v1/crates/<pkg>`
-- **pkg.go.dev** — `pkg.go.dev/<module>`
+- **PyPI** (`pypi` / `python`) — `pypi.org/pypi/<pkg>/json`
+- **npm** (`npm` / `javascript`) — `registry.npmjs.org/<pkg>`
+- **crates.io** (`rust`) — `crates.io/api/v1/crates/<pkg>`
+- **pkg.go.dev** (`go`) — `pkg.go.dev/<module>`
+- **RubyGems** (`ruby` / `rubygems`) — `rubygems.org/api/v1/gems/<pkg>.json`
+- **NuGet** (`nuget` / `dotnet`) — `api.nuget.org/v3-flatcontainer/<pkg>/index.json`
+- **Packagist** (`php` / `packagist`) — `packagist.org/packages/<vendor>/<pkg>.json`
 
 JSON registry responses are summarized to name/version/license/homepage; HTML
 pages are stripped of script/style/nav/footer. All responses are capped at

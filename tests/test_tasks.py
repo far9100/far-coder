@@ -85,6 +85,39 @@ def test_unique_ids_across_creates():
     assert len(ids) == 20
 
 
+def test_ids_are_sequential_t_prefixed():
+    a = tasks.create("a")
+    b = tasks.create("b")
+    c = tasks.create("c")
+    assert a["id"] == "t1"
+    assert b["id"] == "t2"
+    assert c["id"] == "t3"
+
+
+def test_new_id_skips_legacy_hex_ids():
+    """When a session has hex ids from older versions, new ids still start
+    from t1 (or pick up where the latest tN left off if any tN exists)."""
+    legacy_target: list[dict] = [
+        {"id": "a3f2c1", "content": "old", "status": "pending", "created_at": ""},
+        {"id": "b8e102", "content": "older", "status": "pending", "created_at": ""},
+    ]
+    tasks.bind(legacy_target)
+    new = tasks.create("fresh")
+    assert new["id"] == "t1"
+
+
+def test_new_id_continues_after_existing_t_ids():
+    """If the bound list already has t1, t5 (say from a partial restore),
+    the next id should be t6 — strictly increasing, never colliding."""
+    target: list[dict] = [
+        {"id": "t1", "content": "x", "status": "pending", "created_at": ""},
+        {"id": "t5", "content": "y", "status": "pending", "created_at": ""},
+    ]
+    tasks.bind(target)
+    new = tasks.create("z")
+    assert new["id"] == "t6"
+
+
 # ── tool handlers ─────────────────────────────────────────────────────────────
 
 def test_task_create_handler_returns_id_and_content():

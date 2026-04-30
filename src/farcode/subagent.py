@@ -40,6 +40,16 @@ SUBAGENT_MAX_ITERS = 8
 
 _parent_model: str = ""
 
+# In-memory result cache. Key: (question_norm, focus_area_norm). Value:
+# (final_text, tool_call_count). Cleared whenever the chat session restarts
+# (chat.run_chat calls clear_cache() on /clear and /resume) so stale results
+# never leak between unrelated investigations.
+_result_cache: dict[tuple[str, str], tuple[str, int]] = {}
+
+
+def clear_cache() -> None:
+    _result_cache.clear()
+
 
 def bind_parent_model(model: str) -> None:
     """Record the main agent's model so the subagent tool can inherit it."""
@@ -92,6 +102,15 @@ def run_subagent(
             "explore_subagent cannot be called from within a subagent (depth cap = 1)"
         )
 
+    cache_key = (
+        (question or "").strip().lower(),
+        (focus_area or "").strip().lower(),
+    )
+    cached = _result_cache.get(cache_key)
+    if cached is not None:
+        text, n_calls = cached
+        return f"{text}\n\n[cached]", n_calls
+
     tools = get_subagent_tools()
     model = get_subagent_model(parent_model)
 
@@ -121,11 +140,14 @@ def run_subagent(
             calls = list(response.message.tool_calls or [])
 
             if not calls:
-                return content or "(subagent returned no answer)", tool_call_count
+                final = content or "(subagent returned no answer)"
+                _maybe_cache(cache_key, final, tool_call_count)
+                return final, tool_call_count
 
             if tool_call_count >= SUBAGENT_MAX_ITERS:
                 tail = "\n\n[subagent: tool-call cap reached]" if content else \
                        "(subagent: tool-call cap reached)"
+                # Don't cache cap-reached results — they may be incomplete.
                 return (content + tail).strip(), tool_call_count
 
             messages.append({
@@ -158,3 +180,12 @@ def run_subagent(
         return "(subagent: max iterations reached)", tool_call_count
     finally:
         _set_depth(_depth() - 1)
+
+
+def _maybe_cache(key: tuple[str, str], text: str, n_calls: int) -> None:
+    """Cache a successful subagent result. Errors are deliberately skipped."""
+    if not text:
+        return
+    if text.startswith("Subagent error"):
+        return
+    _result_cache[key] = (text, n_calls)

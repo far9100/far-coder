@@ -569,6 +569,85 @@ def test_classify_for_inline_returns_content_for_normal_file(tmp_path):
     assert reason is None
 
 
+# ── @mention line ranges ─────────────────────────────────────────────────────
+
+def test_at_mention_single_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "src.py"
+    f.write_text("\n".join(f"line {i}" for i in range(1, 11)), encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("see @src.py:3 here")
+    assert misses == []
+    assert any(name.endswith("src.py") for name in found)
+    assert "line 3" in text
+    assert "line 4" not in text
+    assert "lines 3-3" in text
+
+
+def test_at_mention_inclusive_range(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "src.py"
+    f.write_text("\n".join(f"line {i}" for i in range(1, 21)), encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("see @src.py:5-7")
+    assert misses == []
+    assert "line 5" in text
+    assert "line 6" in text
+    assert "line 7" in text
+    assert "line 4" not in text
+    assert "line 8" not in text
+    assert "lines 5-7" in text
+
+
+def test_at_mention_open_ended_range(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "src.py"
+    f.write_text("\n".join(f"line {i}" for i in range(1, 6)), encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("see @src.py:3-")
+    assert misses == []
+    assert "line 3" in text
+    assert "line 5" in text
+    assert "line 2" not in text
+    assert "EOF" in text
+
+
+def test_at_mention_range_out_of_bounds(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "src.py"
+    f.write_text("just one line\n", encoding="utf-8")
+    text, found, misses = chat._expand_at_mentions("see @src.py:99")
+    assert found == []
+    assert any("out of range" in m for m in misses)
+
+
+def test_at_mention_range_bypasses_size_cap(tmp_path, monkeypatch):
+    """Selecting a small range from a huge file should be allowed."""
+    monkeypatch.chdir(tmp_path)
+    big = tmp_path / "huge.log"
+    huge_lines = [f"line {i}" for i in range(1, 100_000)]
+    big.write_text("\n".join(huge_lines), encoding="utf-8")
+    assert big.stat().st_size > chat.MAX_INLINE_BYTES
+
+    text, found, misses = chat._expand_at_mentions("@huge.log:5-7")
+    assert misses == []
+    assert any(name.endswith("huge.log") for name in found)
+    assert "line 5" in text and "line 6" in text and "line 7" in text
+
+
+def test_parse_mention_token_returns_none_for_nonexistent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert chat._parse_mention_token("missing.txt") is None
+    assert chat._parse_mention_token("missing.txt:5-10") is None
+
+
+def test_parse_mention_token_full_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x.py").write_text("y", encoding="utf-8")
+    parsed = chat._parse_mention_token("x.py")
+    assert parsed is not None
+    p, s, e = parsed
+    assert p.name == "x.py"
+    assert s is None and e is None
+
+
 def test_at_completer_suggests_files_in_cwd(tmp_path, monkeypatch):
     from prompt_toolkit.document import Document
     from farcode.completion import AtFileCompleter

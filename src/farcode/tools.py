@@ -397,20 +397,28 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "fetch_doc",
             "description": (
                 "Fetch package documentation from an allow-listed registry "
-                "(PyPI, npm, crates.io, pkg.go.dev). Returns version, summary, "
-                "license, and homepage. DISABLED by default — requires --allow-web "
-                "or FARCODE_ALLOW_WEB=1; do not call without confirming it is enabled."
+                "(PyPI, npm, crates.io, pkg.go.dev, RubyGems, NuGet, Packagist). "
+                "Returns version, summary, license, and homepage where available. "
+                "DISABLED by default — requires --allow-web or FARCODE_ALLOW_WEB=1; "
+                "do not call without confirming it is enabled."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Package name (e.g. 'httpx', 'react', 'serde')",
+                        "description": (
+                            "Package name (e.g. 'httpx', 'react', 'serde', "
+                            "'rails', 'Newtonsoft.Json', 'monolog/monolog')"
+                        ),
                     },
                     "ecosystem": {
                         "type": "string",
-                        "enum": ["auto", "pypi", "python", "npm", "javascript", "rust", "go"],
+                        "enum": [
+                            "auto", "pypi", "python", "npm", "javascript",
+                            "rust", "go", "ruby", "rubygems", "dotnet", "nuget",
+                            "php", "packagist",
+                        ],
                         "description": "Which registry to query. 'auto' defaults to pypi.",
                     },
                 },

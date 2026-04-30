@@ -329,3 +329,207 @@ def test_explore_command_is_in_registry():
     from farcode.commands import SLASH_COMMANDS
     names = [n.split()[0] for n, _ in SLASH_COMMANDS]
     assert "/explore" in names
+
+
+# ── Result cache ─────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _clear_subagent_cache_between_tests():
+    subagent.clear_cache()
+    yield
+    subagent.clear_cache()
+
+
+def test_subagent_caches_successful_result(fake_subagent_ollama):
+    fake = fake_subagent_ollama([
+        _resp("auth lives in src/auth.py"),
+        _resp("SHOULD NOT BE USED"),  # second call would explode if reached
+    ])
+
+    text1, n1 = subagent.run_subagent("where is auth?", None, "p")
+    assert "auth lives" in text1
+    assert "[cached]" not in text1
+
+    text2, n2 = subagent.run_subagent("where is auth?", None, "p")
+    assert text2.endswith("[cached]")
+    assert "auth lives" in text2
+    # Second call must not have hit Ollama
+    assert len(fake.calls) == 1
+
+
+def test_subagent_cache_distinguishes_focus_area(fake_subagent_ollama):
+    fake = fake_subagent_ollama([_resp("auth flow"), _resp("login flow")])
+
+    subagent.run_subagent("trace it", focus_area="src/auth", parent_model="p")
+    subagent.run_subagent("trace it", focus_area="src/login", parent_model="p")
+    # Different focus_area → different cache key, both calls hit Ollama
+    assert len(fake.calls) == 2
+
+
+def test_subagent_cache_normalizes_whitespace_and_case(fake_subagent_ollama):
+    fake = fake_subagent_ollama([_resp("answer")])
+
+    subagent.run_subagent("Where is X?", None, "p")
+    text, _ = subagent.run_subagent("  WHERE IS X?  ", None, "p")
+    assert text.endswith("[cached]")
+    assert len(fake.calls) == 1
+
+
+def test_subagent_cache_skips_errors(fake_subagent_ollama, monkeypatch):
+    """call_nonstream raises -> 'Subagent error: ...' returned but NOT cached."""
+    def boom(*a, **kw):
+        raise ValueError("simulated")
+    monkeypatch.setattr(subagent, "call_nonstream", boom)
+
+    text1, _ = subagent.run_subagent("bad call", None, "p")
+    assert "Subagent error" in text1
+
+    # Replace with a working stub for the second call. If the error were cached
+    # we'd see "[cached]" appended to the same error message.
+    fake = fake_subagent_ollama([_resp("recovery")])
+    text2, _ = subagent.run_subagent("bad call", None, "p")
+    assert "[cached]" not in text2
+    assert "recovery" in text2
+
+
+def test_clear_cache_drops_entries(fake_subagent_ollama):
+    fake_subagent_ollama([_resp("first"), _resp("second")])
+
+    subagent.run_subagent("q", None, "p")
+    subagent.clear_cache()
+    text, _ = subagent.run_subagent("q", None, "p")
+    assert "[cached]" not in text
+    assert "second" in text
+
+
+# ── Cap exemption ────────────────────────────────────────────────────────────
+
+def test_explore_subagent_is_in_cap_exempt_set():
+    from farcode.chat import _CAP_EXEMPT_TOOLS
+    assert "explore_subagent" in _CAP_EXEMPT_TOOLS
+
+
+def test_multiple_explore_subagent_calls_bypass_cap(monkeypatch):
+    """When the model emits N explore_subagent calls in one turn, all should
+    survive the cap (even with FARCODE_MAX_TOOLS_PER_TURN=1, the default)."""
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall, _SyntheticResponse
+
+    monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "1")
+
+    # Stub out execute_tool so subagents don't actually run; capture how many
+    # times explore_subagent was dispatched.
+    dispatched: list[str] = []
+    monkeypatch.setattr(chat, "execute_tool",
+                        lambda name, args: dispatched.append(name) or "stubbed")
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+
+    # Fake response: assistant emits 3 explore_subagent calls, then a final answer.
+    calls_msg = _SyntheticResponse(
+        content="fanning out",
+        tool_calls=[
+            _SyntheticToolCall("explore_subagent", {"question": "q1"}),
+            _SyntheticToolCall("explore_subagent", {"question": "q2"}),
+            _SyntheticToolCall("explore_subagent", {"question": "q3"}),
+        ],
+        eval_count=10,
+        prompt_eval_count=20,
+    )
+    final_msg = _SyntheticResponse(content="all done", tool_calls=[],
+                                    eval_count=5, prompt_eval_count=20)
+
+    responses = [calls_msg, final_msg]
+    monkeypatch.setattr(chat, "call_nonstream",
+                        lambda *a, **kw: responses.pop(0) if responses else final_msg)
+    monkeypatch.setattr(chat, "call_with_thinking", lambda fn, stats: fn())
+    monkeypatch.setattr(chat, "render_response", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "_auto_compact",
+                        lambda msgs, *a, **kw: msgs)
+
+    messages: list[dict] = [{"role": "system", "content": ""}]
+    chat._run_agent_turn(messages, "test-model", num_ctx=8192, num_predict=512)
+
+    # All 3 subagent calls must have been dispatched, despite cap=1
+    assert dispatched.count("explore_subagent") == 3
+
+
+def test_non_exempt_tools_still_capped(monkeypatch):
+    """Non-exempt tools (e.g. read_file) past the cap are still dropped."""
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall, _SyntheticResponse
+
+    monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "1")
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(chat, "execute_tool",
+                        lambda name, args: dispatched.append(name) or "ok")
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "call_with_thinking", lambda fn, stats: fn())
+    monkeypatch.setattr(chat, "render_response", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "_auto_compact",
+                        lambda msgs, *a, **kw: msgs)
+
+    calls_msg = _SyntheticResponse(
+        content="reading lots",
+        tool_calls=[
+            _SyntheticToolCall("read_file", {"path": "a"}),
+            _SyntheticToolCall("read_file", {"path": "b"}),
+            _SyntheticToolCall("read_file", {"path": "c"}),
+        ],
+        eval_count=10,
+        prompt_eval_count=20,
+    )
+    final_msg = _SyntheticResponse(content="ok", tool_calls=[],
+                                    eval_count=5, prompt_eval_count=20)
+    responses = [calls_msg, final_msg]
+    monkeypatch.setattr(chat, "call_nonstream",
+                        lambda *a, **kw: responses.pop(0) if responses else final_msg)
+
+    messages: list[dict] = [{"role": "system", "content": ""}]
+    chat._run_agent_turn(messages, "test-model", num_ctx=8192, num_predict=512)
+
+    assert dispatched.count("read_file") == 1  # cap respected for non-exempt
+
+
+def test_mixed_batch_caps_only_non_exempt(monkeypatch):
+    """A mix of explore_subagent + read_file with cap=1 should run all
+    subagents and only one read_file."""
+    from farcode import chat
+    from farcode.client import _SyntheticToolCall, _SyntheticResponse
+
+    monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "1")
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(chat, "execute_tool",
+                        lambda name, args: dispatched.append(name) or "ok")
+    monkeypatch.setattr(chat, "print_tool_call", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "print_info", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "call_with_thinking", lambda fn, stats: fn())
+    monkeypatch.setattr(chat, "render_response", lambda *a, **kw: None)
+    monkeypatch.setattr(chat, "_auto_compact",
+                        lambda msgs, *a, **kw: msgs)
+
+    calls_msg = _SyntheticResponse(
+        content="mixed",
+        tool_calls=[
+            _SyntheticToolCall("read_file", {"path": "a"}),
+            _SyntheticToolCall("explore_subagent", {"question": "q1"}),
+            _SyntheticToolCall("read_file", {"path": "b"}),  # over cap, dropped
+            _SyntheticToolCall("explore_subagent", {"question": "q2"}),
+        ],
+        eval_count=10,
+        prompt_eval_count=20,
+    )
+    final_msg = _SyntheticResponse(content="ok", tool_calls=[],
+                                    eval_count=5, prompt_eval_count=20)
+    responses = [calls_msg, final_msg]
+    monkeypatch.setattr(chat, "call_nonstream",
+                        lambda *a, **kw: responses.pop(0) if responses else final_msg)
+
+    messages: list[dict] = [{"role": "system", "content": ""}]
+    chat._run_agent_turn(messages, "test-model", num_ctx=8192, num_predict=512)
+
+    assert dispatched.count("explore_subagent") == 2
+    assert dispatched.count("read_file") == 1

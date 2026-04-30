@@ -474,20 +474,58 @@ MAX_INLINE_BYTES = 100_000   # 100 KB hard cap on inline file injection
 _BINARY_PROBE_BYTES = 8192    # how much of the head to scan for null bytes
 
 
-def _classify_for_inline(p: Path) -> tuple[str | None, str | None]:
-    """Decide whether ``p`` is safe to inline.
+def _parse_mention_token(token: str) -> tuple[Path, int | None, int | None] | None:
+    """Resolve a ``@`` mention token to (path, start, end) or ``None``.
 
-    Returns ``(content, None)`` if inlinable, or ``(None, reason)`` if the
-    file is too large, binary, or unreadable. ``reason`` is a short string
-    fit for printing to the user (e.g. "binary file", "210 KB exceeds 100 KB
-    inline cap").
+    Accepts:
+      - ``foo.py``                full file
+      - ``foo.py:50``             single line
+      - ``foo.py:50-100``         line range (inclusive)
+      - ``foo.py:50-``            from line 50 through EOF
+
+    Returns ``None`` if no plausible file resolves at the given path or
+    path-prefix. Line numbers are 1-based.
+    """
+    p = Path(token)
+    if p.exists() and p.is_file():
+        return p, None, None
+
+    m = re.match(r"^(.+?):(\d+)(?:-(\d*))?$", token)
+    if m:
+        candidate = Path(m.group(1))
+        if candidate.exists() and candidate.is_file():
+            start = int(m.group(2))
+            end_grp = m.group(3)
+            if end_grp is None:
+                end = start          # ":50"   -> single line
+            elif end_grp == "":
+                end = None           # ":50-"  -> through EOF
+            else:
+                end = int(end_grp)   # ":50-100"
+            return candidate, start, end
+
+    return None
+
+
+def _classify_for_inline(
+    p: Path,
+    start: int | None = None,
+    end: int | None = None,
+) -> tuple[str | None, str | None]:
+    """Decide whether ``p`` is safe to inline (optionally for a line range).
+
+    Returns ``(content, None)`` on success, ``(None, reason)`` otherwise.
+    The whole-file size cap is bypassed when an explicit line range is
+    requested, but the *resulting* slice is still capped to keep tokens
+    bounded.
     """
     try:
         size = p.stat().st_size
     except OSError as e:
         return None, f"unreadable ({e.strerror or e})"
 
-    if size > MAX_INLINE_BYTES:
+    full_file = start is None and end is None
+    if full_file and size > MAX_INLINE_BYTES:
         kb = size // 1024
         cap_kb = MAX_INLINE_BYTES // 1024
         return None, f"{kb} KB exceeds {cap_kb} KB inline cap"
@@ -502,10 +540,28 @@ def _classify_for_inline(p: Path) -> tuple[str | None, str | None]:
         return None, "binary file"
 
     try:
-        content = p.read_text(encoding="utf-8", errors="replace")
+        text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return None, f"unreadable ({e.strerror or e})"
-    return content, None
+
+    if full_file:
+        return text, None
+
+    lines = text.splitlines()
+    n = len(lines)
+    s = max(1, int(start or 1))
+    e = n if end is None else min(int(end), n)
+    if s > n:
+        return None, f"line {s} out of range (file has {n} lines)"
+    if s > e:
+        return None, f"invalid range ({s}-{e})"
+
+    sliced = "\n".join(lines[s - 1:e])
+    if len(sliced.encode("utf-8")) > MAX_INLINE_BYTES:
+        kb = len(sliced) // 1024
+        cap_kb = MAX_INLINE_BYTES // 1024
+        return None, f"slice is {kb} KB, exceeds {cap_kb} KB cap"
+    return sliced, None
 
 
 def _inject_file(messages: list[dict], path: str) -> bool:
@@ -529,11 +585,10 @@ def _inject_file(messages: list[dict], path: str) -> bool:
 def _expand_at_mentions(text: str) -> tuple[str, list[str], list[str]]:
     """Expand ``@path`` mentions in user input.
 
+    Supports trailing ``:start[-end]`` line ranges (e.g. ``@chat.py:50-100``).
     Returns ``(expanded_text, hits, misses)`` where ``hits`` is a list of
-    files that were inlined, and ``misses`` is a list of human-readable
-    strings explaining why each ``@token`` was *not* inlined (file missing,
-    binary, oversize, etc.). Misses keep their literal ``@token`` text in
-    the message so the model still sees the user's reference.
+    files that were inlined and ``misses`` is a list of human-readable
+    strings explaining why each unresolved ``@token`` was *not* inlined.
     """
     found: list[str] = []
     misses: list[str] = []
@@ -541,19 +596,25 @@ def _expand_at_mentions(text: str) -> tuple[str, list[str], list[str]]:
     def _replace(m: re.Match) -> str:
         token_full = m.group(0)
         token_path = m.group(1)
-        p = Path(token_path)
-        if not p.exists():
+
+        parsed = _parse_mention_token(token_path)
+        if parsed is None:
             misses.append(f"{token_full} (not found)")
             return token_full
-        if not p.is_file():
-            misses.append(f"{token_full} (not a regular file)")
-            return token_full
-        content, reason = _classify_for_inline(p)
+
+        p, start, end = parsed
+        content, reason = _classify_for_inline(p, start, end)
         if content is None:
             misses.append(f"{token_full} ({reason})")
             return token_full
+
         found.append(str(p))
-        return f"\n\nFile `{p.name}`:\n```\n{content}\n```\n"
+        if start is None:
+            label = f"`{p.name}`"
+        else:
+            range_str = f"{start}-{end}" if end is not None else f"{start}-EOF"
+            label = f"`{p.name}` (lines {range_str})"
+        return f"\n\nFile {label}:\n```\n{content}\n```\n"
 
     return re.sub(r"@(\S+)", _replace, text), found, misses
 
@@ -561,6 +622,12 @@ def _expand_at_mentions(text: str) -> tuple[str, list[str], list[str]]:
 # ── Parallel tool execution ───────────────────────────────────────────────────
 
 _TASK_MUTATING_TOOLS = frozenset({"task_create", "task_update"})
+
+# Tools exempt from the FARCODE_MAX_TOOLS_PER_TURN cap. Subagents are
+# delegated investigations whose output is already isolated from the main
+# context; letting the model fan out N of them in parallel is the whole
+# point of having the tool.
+_CAP_EXEMPT_TOOLS = frozenset({"explore_subagent"})
 
 
 def _maybe_render_tasks(results: list[tuple[str, dict, str]]) -> None:
@@ -669,9 +736,19 @@ def _run_agent_turn(
 
         cap = max_tools_per_turn()
         dropped = 0
-        if len(tool_calls) > cap:
-            dropped = len(tool_calls) - cap
-            tool_calls = tool_calls[:cap]
+        kept: list = []
+        non_exempt_seen = 0
+        for tc in tool_calls:
+            if tc.function.name in _CAP_EXEMPT_TOOLS:
+                # Subagents can fan out — let multiple run in parallel.
+                kept.append(tc)
+            elif non_exempt_seen < cap:
+                kept.append(tc)
+                non_exempt_seen += 1
+            else:
+                dropped += 1
+        tool_calls = kept
+        if dropped:
             print_info(
                 f"[dim]Dropped {dropped} extra tool call(s); cap is {cap}/turn "
                 f"(set FARCODE_MAX_TOOLS_PER_TURN to change).[/]"
@@ -842,6 +919,7 @@ def run_chat(
             current_session = None
             first_user_seen = False
             _tasks.bind([])  # fresh task list for the new session
+            _subagent.clear_cache()  # drop stale subagent results
             print_info("Conversation cleared. Starting new session.")
             continue
 
@@ -919,6 +997,7 @@ def run_chat(
                 current_session = chosen
                 _tasks.bind(current_session.tasks)
                 _subagent.bind_parent_model(current_model)
+                _subagent.clear_cache()
                 first_user_seen = True
                 compacted = _auto_compact(
                     messages, current_model, num_ctx, num_predict

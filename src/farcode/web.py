@@ -28,6 +28,12 @@ ECOSYSTEM_REGISTRIES: dict[str, callable] = {
     "npm":        lambda pkg: f"https://registry.npmjs.org/{pkg}",
     "rust":       lambda pkg: f"https://crates.io/api/v1/crates/{pkg}",
     "go":         lambda pkg: f"https://pkg.go.dev/{pkg}",
+    "ruby":       lambda pkg: f"https://rubygems.org/api/v1/gems/{pkg}.json",
+    "rubygems":   lambda pkg: f"https://rubygems.org/api/v1/gems/{pkg}.json",
+    "dotnet":     lambda pkg: f"https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/index.json",
+    "nuget":      lambda pkg: f"https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/index.json",
+    "php":        lambda pkg: f"https://packagist.org/packages/{pkg}.json",
+    "packagist":  lambda pkg: f"https://packagist.org/packages/{pkg}.json",
 }
 
 ALLOWED_HOSTS = frozenset({
@@ -35,6 +41,9 @@ ALLOWED_HOSTS = frozenset({
     "registry.npmjs.org",
     "crates.io",
     "pkg.go.dev",
+    "rubygems.org",
+    "api.nuget.org",
+    "packagist.org",
 })
 
 
@@ -183,6 +192,39 @@ def _summarize_json(body: str, ecosystem: str) -> str:
             "documentation": crate.get("documentation"),
             "homepage": crate.get("homepage"),
             "repository": crate.get("repository"),
+        })
+    if ecosystem in ("ruby", "rubygems") and isinstance(data, dict):
+        return _format_kv({
+            "name": data.get("name"),
+            "version": data.get("version"),
+            "info": data.get("info"),
+            "homepage_uri": data.get("homepage_uri"),
+            "source_code_uri": data.get("source_code_uri"),
+            "licenses": data.get("licenses"),
+        })
+    if ecosystem in ("dotnet", "nuget") and isinstance(data, dict):
+        versions = data.get("versions") or []
+        latest = versions[-1] if isinstance(versions, list) and versions else None
+        count = len(versions) if isinstance(versions, list) else None
+        return _format_kv({
+            "latest": latest,
+            "versions_count": count,
+        })
+    if ecosystem in ("php", "packagist") and isinstance(data, dict):
+        pkg = data.get("package") or {}
+        versions = pkg.get("versions") or {}
+        latest = None
+        if isinstance(versions, dict):
+            for v in versions:
+                if not str(v).lower().startswith("dev"):
+                    latest = v
+                    break
+        return _format_kv({
+            "name": pkg.get("name"),
+            "description": pkg.get("description"),
+            "type": pkg.get("type"),
+            "latest": latest,
+            "repository": pkg.get("repository"),
         })
     return body[:2000]
 

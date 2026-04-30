@@ -30,6 +30,9 @@ def test_url_allowlist_accepts_known_hosts():
     assert web._url_in_allowlist("https://registry.npmjs.org/react")
     assert web._url_in_allowlist("https://crates.io/api/v1/crates/serde")
     assert web._url_in_allowlist("https://pkg.go.dev/github.com/gin-gonic/gin")
+    assert web._url_in_allowlist("https://rubygems.org/api/v1/gems/rails.json")
+    assert web._url_in_allowlist("https://api.nuget.org/v3-flatcontainer/x/index.json")
+    assert web._url_in_allowlist("https://packagist.org/packages/v/p.json")
 
 
 def test_url_allowlist_rejects_unknown_hosts():
@@ -125,6 +128,55 @@ def test_fetch_npm_summarizes_json(mock_httpx):
     assert "latest: 18.3.1" in out
     assert "MIT" in out
     assert mock_httpx["calls"][0]["url"] == "https://registry.npmjs.org/react"
+
+
+def test_fetch_rubygems_summarizes_json(mock_httpx):
+    payload = json.dumps({
+        "name": "rails",
+        "version": "7.1.3",
+        "info": "Full-stack web application framework.",
+        "homepage_uri": "https://rubyonrails.org",
+        "licenses": ["MIT"],
+    })
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+    out = web.fetch("rails", "ruby")
+    assert "name: rails" in out
+    assert "version: 7.1.3" in out
+    assert "MIT" in out
+    assert mock_httpx["calls"][0]["url"] == "https://rubygems.org/api/v1/gems/rails.json"
+
+
+def test_fetch_nuget_lowercases_package_name(mock_httpx):
+    payload = json.dumps({"versions": ["3.5.8", "12.0.3", "13.0.3"]})
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+    out = web.fetch("Newtonsoft.Json", "nuget")
+    assert "latest: 13.0.3" in out
+    assert "versions_count: 3" in out
+    # URL must be lowercased
+    assert mock_httpx["calls"][0]["url"] == \
+        "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json"
+
+
+def test_fetch_packagist_summarizes_json(mock_httpx):
+    payload = json.dumps({
+        "package": {
+            "name": "monolog/monolog",
+            "description": "Sends your logs to files, sockets, inboxes...",
+            "type": "library",
+            "repository": "https://github.com/Seldaek/monolog",
+            "versions": {
+                "3.5.0": {},
+                "3.4.0": {},
+                "dev-main": {},
+            },
+        }
+    })
+    mock_httpx["next_response"] = _FakeResponse(payload, 200, "application/json")
+    out = web.fetch("monolog/monolog", "php")
+    assert "name: monolog/monolog" in out
+    assert "latest: 3.5.0" in out  # dev-main skipped
+    assert mock_httpx["calls"][0]["url"] == \
+        "https://packagist.org/packages/monolog/monolog.json"
 
 
 def test_fetch_crates_summarizes_json(mock_httpx):
