@@ -33,7 +33,7 @@ farcode chat -f src/main.py        # pre-load a file
 farcode chat -b                    # background mode (type while AI works)
 farcode chat --allow-bash          # skip confirmation on shell commands
 farcode chat --allow-all           # auto-approve ALL tool calls, no prompts
-farcode chat --allow-web           # enable scoped fetch_doc tool (PyPI/npm/crates/pkg.go.dev)
+farcode chat --allow-web           # enable scoped fetch_doc (PyPI/npm/crates/pkg.go.dev/RubyGems/NuGet/Packagist)
 ```
 
 **In-session commands** — type `/help` at any time for the categorized list (Discovery / Files & code / Session / Config sections):
@@ -100,7 +100,7 @@ During `chat`, the AI can use these tools autonomously:
 | `task_update(id, status)` | Mark a task `pending` / `in_progress` / `completed` |
 | `task_list()` | List all current tasks with status |
 | `explore_subagent(question, focus_area?)` | Delegate a focused investigation to a read-only sub-agent |
-| `fetch_doc(query, ecosystem?)` | Look up package metadata on PyPI/npm/crates.io/pkg.go.dev (requires `--allow-web`) |
+| `fetch_doc(query, ecosystem?)` | Look up package metadata on PyPI / npm / crates.io / pkg.go.dev / RubyGems / NuGet / Packagist (requires `--allow-web`) |
 
 After every file write, farcode runs a per-language **syntax check** (Python `ast`,
 `json.loads`, optional `node --check` / `tsc --noEmit`) and appends the result to
@@ -113,10 +113,14 @@ up front and `task_update` as it progresses, giving you a visible plan. Type
 `/tasks` to see the current list at any time:
 
 ```
-○ a3f2c1: read auth.py
-→ b8e102: extract login flow
-✓ c0d1f4: write integration test
+○ t1: read auth.py
+→ t2: extract login flow
+✓ t3: write integration test
 ```
+
+Task IDs are short sequential strings (`t1`, `t2`, ...), so the LLM and you
+can reference them naturally. Older sessions that used 6-char hex ids still
+load and update correctly.
 
 Tasks live on `Session.tasks` and are persisted to disk with the rest of the
 session, so they survive `/resume`. Whenever the model calls `task_create` or
@@ -201,6 +205,8 @@ Farcode includes several mitigations:
 - **One tool call per turn by default** (`FARCODE_MAX_TOOLS_PER_TURN=1`).
   Small models often emit one good call plus one malformed one; serial
   execution dramatically improves success rate. Set to `0` for unlimited.
+  `explore_subagent` is exempt from this cap, so the model can fan out
+  multiple sub-investigations in a single turn even at default settings.
 - **Grammar-constrained tool retry**: when Ollama 500s on a malformed
   tool call, farcode retries once with `format=<json_schema>` constraining
   output to a valid `{tool_call|answer}` shape, then falls back to plain
