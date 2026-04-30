@@ -36,11 +36,11 @@ farcode chat --allow-all           # auto-approve ALL tool calls, no prompts
 farcode chat --allow-web           # enable scoped fetch_doc tool (PyPI/npm/crates/pkg.go.dev)
 ```
 
-**In-session commands** — type `/help` at any time for the live list:
+**In-session commands** — type `/help` at any time for the categorized list (Discovery / Files & code / Session / Config sections):
 
 | Command | Description |
 |---------|-------------|
-| `/help` | List all slash commands |
+| `/help` | List all slash commands, grouped by section |
 | `/exit` or `/quit` | Save summary and exit |
 | `/clear` | Wipe conversation, start a new session |
 | `/file <path>` | Inject a file into the conversation |
@@ -52,8 +52,9 @@ farcode chat --allow-web           # enable scoped fetch_doc tool (PyPI/npm/crat
 | `/reindex` | Force-rebuild the code-chunk embedding index |
 | `/resume` | Pick a saved session to resume |
 | `/tasks` | Show the in-session task list (see [Tasks](#in-session-tasks)) |
+| `/explore <q>` | Run a [read-only sub-agent](#read-only-sub-agents) on a question, without going through the main agent |
 
-**Attaching files inline** — type `@path/to/file` anywhere in your message to inline its contents (the prompt offers tab completion after `@`). If a path doesn't resolve, farcode prints a warning and leaves the `@token` as plain text.
+**Attaching files inline** — type `@path/to/file` anywhere in your message to inline its contents. The prompt offers tab completion after `@`. Files larger than 100 KB or detected as binary (null bytes in the first 8 KB) are skipped with a printed reason; misses also report a reason ("not found", "not a regular file", "binary file", etc.) instead of being silently dropped.
 
 ### `review` — Code review
 
@@ -118,7 +119,9 @@ up front and `task_update` as it progresses, giving you a visible plan. Type
 ```
 
 Tasks live on `Session.tasks` and are persisted to disk with the rest of the
-session, so they survive `/resume`.
+session, so they survive `/resume`. Whenever the model calls `task_create` or
+`task_update`, farcode auto-renders the full task list once at the end of that
+tool batch so progress stays visible without typing `/tasks`.
 
 ### Read-only sub-agents
 
@@ -138,6 +141,10 @@ Constraints (enforced):
 - Set `FARCODE_SUBAGENT_MODEL` to use a smaller/cheaper model for exploration
   while the main agent keeps its larger model.
 
+When a sub-agent runs you'll see live `Subagent exploring: ...` and `Subagent
+done: N tool call(s), X chars` lines so the wait is never silent. You can also
+trigger one directly with `/explore <question>` (skips the main agent).
+
 ### Web access (opt-in)
 
 `fetch_doc` is **disabled by default** to preserve the local-first stance. When
@@ -153,6 +160,11 @@ JSON registry responses are summarized to name/version/license/homepage; HTML
 pages are stripped of script/style/nav/footer. All responses are capped at
 8 KB. Package names are validated to reject path-traversal and shell
 metacharacters. No general URL fetch is supported; no search-engine integration.
+
+Successful responses are cached on disk at `~/.farcode_doc_cache.json` for 24 h
+(LRU-pruned at 200 entries) so repeat lookups skip the network. Cached results
+are tagged `[cached]` in the returned text. Errors (4xx / 5xx / network) are
+never cached.
 
 ## Context the AI sees
 
