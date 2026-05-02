@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Tooling caches
+.pytest_cache/
+
+# Claude Code local session state
+.claude/scheduled_tasks.lock
+
+# Evaluation / benchmark outputs
+out/
+logs/
+farcode-*.json

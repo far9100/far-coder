@@ -12,6 +12,12 @@ dependencies = [
     "typer>=0.24.2",
 ]
 
+[project.optional-dependencies]
+eval = [
+    "datasets>=2.18",
+    "swebench>=2.1",
+]
+
 [project.scripts]
 farcode = "farcode.cli:app"
 
