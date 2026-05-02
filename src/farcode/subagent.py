@@ -189,3 +189,111 @@ def _maybe_cache(key: tuple[str, str], text: str, n_calls: int) -> None:
     if text.startswith("Subagent error"):
         return
     _result_cache[key] = (text, n_calls)
+
+
+# ── Patch critique subagent (SWE-bench mode) ──────────────────────────────────
+#
+# Goal: catch obvious problems before the patch is submitted — wrong location,
+# missing the actual contract, or breaking nearby code. The subagent sees the
+# diff and the modified files (read-only) and reports up to 3 risks. With a 4B
+# model self-critiquing, we expect modest lift; gated behind FARCODE_SWE_CRITIQUE
+# so it can be measured independently in the ablation matrix.
+
+_CRITIQUE_SYSTEM = (
+    "You are a code-review subagent. Read the patch (a unified diff) and the "
+    "modified files, plus the original problem statement. Your only job is to "
+    "list up to 3 SPECIFIC concerns about whether the patch will fix the "
+    "issue and not break other tests.\n\n"
+    "## Rules\n"
+    "- Do NOT propose a new fix. Do NOT suggest refactors.\n"
+    "- Each concern must cite a file path and a one-sentence reason.\n"
+    "- If the patch looks correct, reply: 'No major concerns.'\n"
+    "- Maximum 200 words. Be concrete, not generic.\n"
+    "- Do not call any tools other than read_file and search_in_files."
+)
+
+
+def run_critique_subagent(
+    diff: str,
+    problem_statement: str,
+    parent_model: str,
+    num_ctx: int = DEFAULT_NUM_CTX,
+    num_predict: int = DEFAULT_NUM_PREDICT,
+) -> tuple[str, int]:
+    """Spawn a read-only subagent to review a patch. Returns (text, n_calls).
+
+    The diff is truncated at 4 KB and the problem statement at 2 KB so the
+    subagent's first prompt fits comfortably. Subsequent ``read_file`` calls
+    let it pull in surrounding context for any file mentioned in the diff.
+    """
+    if _depth() > 0:
+        return "(critique skipped: already in subagent)", 0
+
+    diff_clip = diff[:4096] + ("\n[... diff truncated ...]" if len(diff) > 4096 else "")
+    ps_clip = (problem_statement or "").strip()
+    if len(ps_clip) > 2048:
+        ps_clip = ps_clip[:2048] + "\n[... truncated ...]"
+
+    user_content = (
+        "## Problem\n"
+        f"{ps_clip}\n\n"
+        "## Proposed patch (unified diff)\n"
+        f"```diff\n{diff_clip}\n```\n\n"
+        "List up to 3 concerns or reply 'No major concerns.'"
+    )
+
+    tools = get_subagent_tools()
+    model = get_subagent_model(parent_model)
+    messages: list[dict] = [
+        {"role": "system", "content": _CRITIQUE_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    tool_call_count = 0
+
+    _set_depth(_depth() + 1)
+    try:
+        # Tighter cap than the exploration subagent — critique should be a
+        # few targeted reads, not a full investigation.
+        for _ in range(5):
+            try:
+                response = call_nonstream(
+                    messages, model, tools=tools,
+                    num_ctx=num_ctx, num_predict=num_predict,
+                )
+            except Exception as e:
+                return f"(critique error: {e})", tool_call_count
+
+            content = (response.message.content or "").strip()
+            calls = list(response.message.tool_calls or [])
+
+            if not calls:
+                return content or "No major concerns.", tool_call_count
+
+            messages.append({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": dict(tc.function.arguments),
+                        }
+                    }
+                    for tc in calls
+                ],
+            })
+            for tc in calls:
+                name = tc.function.name
+                if name not in READ_ONLY_TOOL_NAMES:
+                    result = (
+                        f"Tool '{name}' is not allowed in critique subagent."
+                    )
+                else:
+                    args = dict(tc.function.arguments)
+                    result = execute_tool(name, args)
+                tool_call_count += 1
+                messages.append({"role": "tool", "content": result})
+
+        return "(critique: iteration cap reached)", tool_call_count
+    finally:
+        _set_depth(_depth() - 1)

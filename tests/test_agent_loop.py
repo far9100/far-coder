@@ -192,3 +192,23 @@ def test_tool_schemas_passed_to_model(fake_ollama):
     sent_names = {t["function"]["name"] for t in sent_tools}
     # Sanity check a few core tools are on the wire.
     assert {"read_file", "edit_file", "write_file"}.issubset(sent_names)
+
+
+def test_critique_patch_hidden_by_default(fake_ollama):
+    """In normal (non-SWE-mode) runs, critique_patch must not appear in the
+    tool list — it'd just confuse the model in an interactive session."""
+    fake = fake_ollama([make_response("ok")])
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    chat._run_agent_turn(msgs, model="m", num_ctx=8192, num_predict=512)
+    sent_names = {t["function"]["name"] for t in fake.calls[0]["tools"]}
+    assert "critique_patch" not in sent_names
+
+
+def test_critique_patch_visible_in_swe_mode(fake_ollama, monkeypatch):
+    """Set FARCODE_SWE_CRITIQUE=1 → critique_patch becomes visible."""
+    monkeypatch.setenv("FARCODE_SWE_CRITIQUE", "1")
+    fake = fake_ollama([make_response("ok")])
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    chat._run_agent_turn(msgs, model="m", num_ctx=8192, num_predict=512)
+    sent_names = {t["function"]["name"] for t in fake.calls[0]["tools"]}
+    assert "critique_patch" in sent_names

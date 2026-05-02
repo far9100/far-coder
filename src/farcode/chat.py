@@ -31,6 +31,7 @@ from .memory import append_entry, current_project_path
 from .sessions import Session, load_sessions, new_session, save_session
 from .tools import (
     TOOL_SCHEMAS,
+    get_active_tool_schemas,
     bash_require_confirm,
     clear_snapshots,
     execute_tool,
@@ -708,7 +709,7 @@ def _run_agent_turn(
             stats.input_tokens = _total_tokens(trimmed)
             response = call_with_thinking(
                 lambda: call_nonstream(
-                    trimmed, model, tools=TOOL_SCHEMAS,
+                    trimmed, model, tools=get_active_tool_schemas(),
                     num_ctx=num_ctx, num_predict=num_predict,
                 ),
                 stats,

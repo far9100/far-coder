@@ -10,6 +10,8 @@ from pathlib import Path
 
 from rich.prompt import Confirm
 
+from ._env import env_on
+
 # ── Bash sandboxing ───────────────────────────────────────────────────────────
 
 _bash_require_confirm: bool = True
@@ -50,16 +52,20 @@ def web_enabled() -> bool:
 def max_tools_per_turn() -> int:
     """Cap on tool calls executed in a single agent turn.
 
-    Small models often emit one good call plus one malformed one. Defaulting
-    to 1 forces serial execution, which dramatically improves reliability on
-    qwen3-class 4B models. Set FARCODE_MAX_TOOLS_PER_TURN=0 (or any large
-    number) to allow parallel calls again.
+    Default unlimited. Earlier versions defaulted to 1 (serial execution) on the
+    theory that small models emit one good call plus one malformed one and
+    serial dispatch reduces the malformed-call risk. SWE-bench Lite measurements
+    on qwen3.5:4b found the opposite: forcing serial across many short turns
+    causes the agent to lose track of where it was earlier in the investigation
+    and pick the wrong edit location more often than the malformed-call risk
+    cap=1 was meant to avoid. Set FARCODE_MAX_TOOLS_PER_TURN=1 to restore the
+    old serial behaviour if your model needs it.
     """
-    raw = os.environ.get("FARCODE_MAX_TOOLS_PER_TURN", "1")
+    raw = os.environ.get("FARCODE_MAX_TOOLS_PER_TURN", "0")
     try:
         n = int(raw)
     except ValueError:
-        return 1
+        return 999
     return n if n > 0 else 999
 
 
@@ -455,7 +461,59 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # SWE-bench critique tool: visible only when FARCODE_SWE_CRITIQUE=1 (filtered
+    # by get_active_tool_schemas). Spawns a read-only subagent that reviews the
+    # current `git diff` and the original problem statement, returning up to 3
+    # concrete risk callouts before the agent submits.
+    {
+        "type": "function",
+        "function": {
+            "name": "critique_patch",
+            "description": (
+                "Review the current uncommitted patch against the original problem "
+                "statement before submitting. Returns up to 3 concerns or 'No major "
+                "concerns.' Call ONCE just before stopping in SWE-bench mode."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Short note like 'about to submit' for the log",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
+
+
+# Tools that are conditionally hidden from the model — keeps the schema list
+# short for small models and avoids tempting them to call no-op tools in
+# regular use. The keys here MUST match the function names in TOOL_SCHEMAS.
+_GATED_TOOLS: dict[str, str] = {
+    "critique_patch": "FARCODE_SWE_CRITIQUE",
+    # fetch_doc has its own (web_enabled) gate inside the handler; we leave
+    # it visible because the existing system prompt teaches the model to
+    # check whether it's enabled.
+}
+
+
+def get_active_tool_schemas() -> list[dict]:
+    """``TOOL_SCHEMAS`` with gated tools filtered out per current env.
+
+    Used by the agent loop instead of the raw constant so that experimental
+    or mode-specific tools don't pollute the model's tool list in normal
+    runs. When the gate env var is on, the tool reappears.
+    """
+    return [
+        s for s in TOOL_SCHEMAS
+        if (
+            s.get("function", {}).get("name") not in _GATED_TOOLS
+            or env_on(_GATED_TOOLS[s["function"]["name"]])
+        )
+    ]
 
 
 def execute_tool(name: str, arguments: dict) -> str:
@@ -476,6 +534,7 @@ def execute_tool(name: str, arguments: dict) -> str:
         "task_list": _task_list,
         "explore_subagent": _explore_subagent,
         "fetch_doc": _fetch_doc,
+        "critique_patch": _critique_patch,
     }
     handler = handlers.get(name)
     if not handler:
@@ -532,6 +591,8 @@ def _fetch_doc(query: str, ecosystem: str = "auto") -> str:
 # ── Subagent handler ─────────────────────────────────────────────────────────
 
 def _explore_subagent(question: str, focus_area: str | None = None) -> str:
+    if env_on("FARCODE_DISABLE_SUBAGENT"):
+        return "Tool error: explore_subagent disabled in this run."
     from . import subagent as _sub
     from .ui import print_info
     parent_model = _sub.get_parent_model()
@@ -556,6 +617,60 @@ def _explore_subagent(question: str, focus_area: str | None = None) -> str:
     return f"{header}\n\n{result}"
 
 
+def _critique_patch(reason: str = "") -> str:
+    """Spawn the read-only critique subagent against the current uncommitted
+    diff. Only meaningful in SWE-bench mode — the gate keeps the tool out of
+    the model's schema list otherwise, so this body is a defensive backstop."""
+    if not env_on("FARCODE_SWE_CRITIQUE"):
+        return "Tool error: critique_patch is only available in SWE-bench mode."
+    if env_on("FARCODE_DISABLE_SUBAGENT"):
+        return "Tool error: critique_patch needs subagent support, which is disabled."
+
+    from . import subagent as _sub
+    from .ui import print_info
+
+    parent_model = _sub.get_parent_model()
+    if not parent_model:
+        return "Tool error: no parent model bound; cannot start critique."
+
+    # Stage everything so `git diff --cached` shows the full uncommitted patch
+    # (mirrors the harness's _extract_patch logic).
+    try:
+        subprocess.run(
+            ["git", "add", "-A"],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--no-color"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+        # Reset the index so we don't accidentally leave files staged
+        subprocess.run(
+            ["git", "reset"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        return f"Tool error: couldn't compute diff for critique: {e}"
+
+    if not diff.strip():
+        return "No patch to review yet — make at least one edit before calling critique_patch."
+
+    # The original problem statement is exported by solve.py before farcode
+    # starts so the critique has the same context the agent had.
+    problem = os.environ.get("FARCODE_SWE_PROBLEM", "")
+
+    print_info(f"[bold cyan]Critique[/] running ({reason or 'review'})")
+    try:
+        result, n_calls = _sub.run_critique_subagent(diff, problem, parent_model)
+    except RuntimeError as e:
+        return f"Tool error: {e}"
+    print_info(
+        f"[bold cyan]Critique[/] done: {n_calls} tool call(s), {len(result)} chars"
+    )
+    header = f"[critique ran {n_calls} tool call(s)]"
+    return f"{header}\n\n{result}"
+
+
 # ── Post-edit syntax check ────────────────────────────────────────────────────
 
 def _check_syntax(path: str) -> str:
@@ -564,6 +679,8 @@ def _check_syntax(path: str) -> str:
     Skips silently for unrecognized extensions and for tools that are missing.
     Output is suffixed onto the tool result so the model can self-correct.
     """
+    if env_on("FARCODE_DISABLE_RELIABILITY"):
+        return ""
     p = Path(path)
     ext = p.suffix.lower()
     if not p.is_file():
@@ -716,6 +833,80 @@ def _fuzzy_locate(content: str, old_str: str) -> tuple[int, int] | None:
     return None
 
 
+def _edit_failure_hint(content: str, old_str: str, path: str) -> str:
+    """Build a hint message showing the closest matching region in ``content``
+    when an edit_file call's ``old_str`` could not be located.
+
+    Strategy: take the first non-empty line of ``old_str`` as a probe, find
+    the line in ``content`` with the highest character-level overlap, then
+    show ±2 lines of context around it with 1-based line numbers. Lets the
+    model either correct its old_str or switch to ``replace_lines`` with the
+    captured line numbers — saves a wasted retry-and-fail turn.
+
+    Output capped at ~800 chars so a giant near-match doesn't blow the tool
+    output budget.
+    """
+    target_lines = [ln.strip() for ln in old_str.splitlines() if ln.strip()]
+    if not target_lines:
+        return (
+            "Hint: old_str was empty after stripping whitespace. "
+            "Use write_file or replace_lines instead."
+        )
+    probe = target_lines[0]
+
+    content_lines = content.splitlines()
+    if not content_lines:
+        return f"Hint: {path} is empty. Use write_file to create content."
+
+    # Score each line by the longest common substring with `probe`. O(n*m) but
+    # files we edit are typically <5k lines.
+    best_idx = 0
+    best_score = 0
+    probe_norm = probe.lower()
+    for i, line in enumerate(content_lines):
+        ln = line.strip().lower()
+        if not ln:
+            continue
+        # Quick: count of common 4-grams. Cheaper than difflib for the common
+        # case of "model copied a single recognizable identifier".
+        score = 0
+        if probe_norm in ln or ln in probe_norm:
+            score = max(len(probe_norm), len(ln))
+        else:
+            for j in range(max(0, len(probe_norm) - 3)):
+                if probe_norm[j:j + 4] in ln:
+                    score += 4
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_score == 0:
+        return (
+            "Hint: no similar line found in the file. The file may have "
+            "changed since you last read it — call read_file again, or use "
+            "replace_lines / write_file with content you can verify."
+        )
+
+    lo = max(0, best_idx - 2)
+    hi = min(len(content_lines), best_idx + 3)
+    snippet_lines = []
+    for k in range(lo, hi):
+        marker = ">" if k == best_idx else " "
+        snippet_lines.append(f"{marker} {k + 1:>5}: {content_lines[k]}")
+    snippet = "\n".join(snippet_lines)
+    if len(snippet) > 600:
+        snippet = snippet[:600] + "\n  ...[truncated]"
+
+    return (
+        f"Hint: closest match is line {best_idx + 1} of {len(content_lines)}:\n"
+        f"{snippet}\n"
+        f"If this is the right region, call replace_lines("
+        f"path={path!r}, start_line={best_idx + 1}, end_line={best_idx + 1}, "
+        f"new_content=...) — or re-read the file and try edit_file again with "
+        f"the exact text shown above."
+    )
+
+
 def _edit_file(path: str, old_str: str, new_str: str) -> str:
     p = Path(path)
     if not p.exists():
@@ -724,10 +915,15 @@ def _edit_file(path: str, old_str: str, new_str: str) -> str:
 
     span = _fuzzy_locate(content, old_str)
     if span is None:
+        # Surface the closest near-match so the model can see WHY its old_str
+        # missed (whitespace? renamed identifier? content changed?). Without
+        # this, 4B models often retry the same broken edit 3+ times until
+        # the duplicate-edit detector aborts — burning the tool budget.
+        hint = _edit_failure_hint(content, old_str, path)
         return (
             f"Error: old_str not found in {path}.\n"
-            "Tried exact match and whitespace-tolerant match. Either re-read the "
-            "file (it may have changed), or use replace_lines / write_file instead."
+            "Tried exact match and whitespace-tolerant match.\n"
+            f"{hint}"
         )
     start, end = span
     note = ""

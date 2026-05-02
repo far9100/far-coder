@@ -6,13 +6,37 @@ from typing import Any
 
 import ollama
 
+from ._env import env_on
+
 DEFAULT_NUM_CTX = int(os.environ.get("FARCODE_NUM_CTX", "65536"))
 DEFAULT_NUM_PREDICT = int(os.environ.get("FARCODE_NUM_PREDICT", "4096"))
 
 
+_SWE_MODE_ADDENDUM = (
+    "\n\n## SWE-bench mode\n"
+    "- If a `## Suspected locations` or `## Test contract` section appears "
+    "in the user message, read those files / satisfy those tests first.\n"
+    "- Never read or edit any file under tests/ — those are read-only contracts."
+)
+# History note (Docker-scored on the 10-instance v2 subset, qwen3.5:4b):
+#   * M5 (~9 lines, "smallest possible patch / stop and reply when done"):
+#     3/10 resolved. "Stop and reply" framing made the model bail on hard
+#     cases (django-14999 hit max_tools/0 lines).
+#   * M6 (this 2-line minimal version): 2/10 resolved. Eliminated the bail
+#     framing but introduced two new empty patches (sympy-13146 / -14308).
+#   * M6 + "MUST produce at least one edit" pressure: 1/10 resolved. The
+#     commitment phrasing pushed the model to over-edit (django-11179
+#     ballooned from a passing 12-line surgical fix to a failing 31-line
+#     patch; django-14999 produced a 263-line patch).
+# Conclusion: prompt micro-tuning has nonlinear / counterproductive effects
+# on a 4B model. The M6 minimal version (kept here) is the least-bad
+# intermediate; further gains likely require a non-prompt lever (lower
+# temperature, multiple seeds, test execution feedback, or larger model).
+
+
 def _system_prompt(num_ctx: int = DEFAULT_NUM_CTX) -> str:
     ctx_k = max(1, num_ctx // 1024)
-    return (
+    base = (
         "You are a coding assistant on Windows. Use the provided tools to read, "
         "edit, and run code in the user's project.\n\n"
         "## Workflow\n"
@@ -42,6 +66,19 @@ def _system_prompt(num_ctx: int = DEFAULT_NUM_CTX) -> str:
         "it returns 'disabled' — that means web access is off.\n\n"
         f"Context window is {ctx_k}K tokens. Keep replies short."
     )
+    if env_on("FARCODE_SWE_MODE"):
+        # Patch-shape discipline: results-2026-05-01.md found 4B model
+        # produced 558/514/803-line patches when 5-10 lines would have
+        # sufficed. The addendum nudges toward minimal surgical edits and
+        # tells the model to trust the locator's suspect-list section.
+        base += _SWE_MODE_ADDENDUM
+        if env_on("FARCODE_SWE_CRITIQUE"):
+            base += (
+                "\n- Before saying you are done, call "
+                "`critique_patch('about to submit')` ONCE and read the response. "
+                "If it raises concerns you can address quickly, do so, then stop."
+            )
+    return base
 
 
 SYSTEM_PROMPT = _system_prompt()
@@ -60,7 +97,30 @@ class StreamStats:
 
 
 def _ollama_options(num_ctx: int, num_predict: int) -> dict:
-    return {"num_ctx": num_ctx, "num_predict": num_predict}
+    """Build the options dict passed to ollama.chat.
+
+    Honors a few env-var overrides so the SWE-bench harness can adjust
+    sampling without touching code:
+      * FARCODE_TEMPERATURE — float, 0.0-2.0. Default is Ollama's modelfile
+        value (~0.7 for qwen3.5:4b). Lowering reduces variance, which the
+        post-M6 evaluation identified as the dominant blocker on a 4B model.
+      * FARCODE_SEED — int. Sets Ollama's RNG seed for reproducible outputs.
+        Useful for A/B'ing prompt changes without sampling noise.
+    """
+    opts: dict = {"num_ctx": num_ctx, "num_predict": num_predict}
+    temp = os.environ.get("FARCODE_TEMPERATURE", "").strip()
+    if temp:
+        try:
+            opts["temperature"] = float(temp)
+        except ValueError:
+            pass
+    seed = os.environ.get("FARCODE_SEED", "").strip()
+    if seed:
+        try:
+            opts["seed"] = int(seed)
+        except ValueError:
+            pass
+    return opts
 
 
 def stream_chat(
@@ -117,17 +177,23 @@ def call_nonstream(
     }
     if tools:
         kwargs["tools"] = tools
+        # Mirror stream_agent_iter: thinking mode breaks structured tool_calls
+        # in qwen3-class models. As of 2026-05 we also see qwen3.5:4b return
+        # EMPTY message.content with thinking enabled even on plain replies, so
+        # we disable it for any tool-call request to keep both paths reliable.
+        kwargs["think"] = False
     try:
         return ollama.chat(**kwargs)
     except ollama.ResponseError as e:
         if e.status_code != 500 or not tools:
             raise
 
-        retry = _grammar_constrained_tool_call(
-            messages, model, tools, num_ctx, num_predict
-        )
-        if retry is not None:
-            return retry
+        if not env_on("FARCODE_DISABLE_RELIABILITY"):
+            retry = _grammar_constrained_tool_call(
+                messages, model, tools, num_ctx, num_predict
+            )
+            if retry is not None:
+                return retry
 
         kwargs.pop("tools", None)
         return ollama.chat(**kwargs)
@@ -322,13 +388,14 @@ def build_system_messages(
     """
     parts: list[str] = [_system_prompt(num_ctx)]
 
-    try:
-        from .coder_md import load_coder_md
-        rules = load_coder_md()
-        if rules:
-            parts.append(rules)
-    except Exception:
-        pass
+    if not env_on("FARCODE_DISABLE_CODER_MD"):
+        try:
+            from .coder_md import load_coder_md
+            rules = load_coder_md()
+            if rules:
+                parts.append(rules)
+        except Exception:
+            pass
 
     try:
         from .facts import get_or_build_facts
@@ -338,28 +405,40 @@ def build_system_messages(
     except Exception:
         pass
 
-    try:
-        from .repomap import build_repo_map
-        repo = build_repo_map()
-        if repo:
-            parts.append(repo)
-    except Exception:
-        pass
+    if not env_on("FARCODE_DISABLE_REPOMAP"):
+        try:
+            seeds = os.environ.get("FARCODE_REPOMAP_SEEDS", "").strip()
+            if seeds:
+                # Focused map: BFS from seed files via imports, bypasses the
+                # >100-file global cutoff. Set by the SWE-bench harness from
+                # locator output so big repos (django, sympy) get a useful
+                # targeted map instead of no map at all.
+                from .repomap import build_focused_repo_map
+                seed_list = [s for s in (x.strip() for x in seeds.split(",")) if s]
+                repo = build_focused_repo_map(seed_list)
+            else:
+                from .repomap import build_repo_map
+                repo = build_repo_map()
+            if repo:
+                parts.append(repo)
+        except Exception:
+            pass
 
-    try:
-        from .memory import current_project_path, format_for_prompt, load_recent, search
-        project = current_project_path()
-        if first_user_message:
-            entries = search(first_user_message, top_k=3, project_path=project, scope="project")
-            if not entries:
+    if not env_on("FARCODE_DISABLE_MEMORY"):
+        try:
+            from .memory import current_project_path, format_for_prompt, load_recent, search
+            project = current_project_path()
+            if first_user_message:
+                entries = search(first_user_message, top_k=3, project_path=project, scope="project")
+                if not entries:
+                    entries = load_recent(3, project_path=project)
+            else:
                 entries = load_recent(3, project_path=project)
-        else:
-            entries = load_recent(3, project_path=project)
-        past = format_for_prompt(entries)
-        if past:
-            parts.append(past)
-    except Exception:
-        pass
+            past = format_for_prompt(entries)
+            if past:
+                parts.append(past)
+        except Exception:
+            pass
 
     return [{"role": "system", "content": "\n\n".join(parts)}]
 

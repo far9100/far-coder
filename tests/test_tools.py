@@ -277,6 +277,35 @@ def test_edit_file_no_match_message_mentions_alternatives(tmp_path):
     assert "replace_lines" in result or "write_file" in result
 
 
+def test_edit_file_no_match_shows_closest_line_with_number(tmp_path):
+    """When a near-match exists, the failure should point at it by line number
+    so the model can switch to replace_lines without re-reading."""
+    f = tmp_path / "a.py"
+    f.write_text(
+        "def foo():\n"
+        "    return original_value\n"
+        "def bar():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    # Model thinks it's "return ORIGINAL_value" with different casing/spaces
+    result = _edit_file(str(f), "return  original_value", "return updated")
+    assert result.startswith("Error:")
+    # Should call out line 2 (the closest match)
+    assert "line 2" in result or " 2:" in result
+    assert "original_value" in result  # snippet shown
+    assert "replace_lines" in result   # suggested next step
+
+
+def test_edit_file_no_match_with_empty_old_str(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("anything\n", encoding="utf-8")
+    result = _edit_file(str(f), "   \n  ", "x")
+    assert result.startswith("Error:")
+    # Empty-after-strip should be flagged distinctly
+    assert "empty" in result.lower()
+
+
 def test_edit_file_reports_duplicate_count(tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("a\na\na\n", encoding="utf-8")
@@ -408,8 +437,11 @@ def test_edit_file_appends_syntax_warning(tmp_path):
 # ── max_tools_per_turn ────────────────────────────────────────────────────────
 
 def test_max_tools_default(monkeypatch):
+    # Default is "unlimited" (0 → 999) since the SWE-bench Lite ablation
+    # showed serial-by-default hurt 4B model localization. See the docstring
+    # on max_tools_per_turn() for the full rationale.
     monkeypatch.delenv("FARCODE_MAX_TOOLS_PER_TURN", raising=False)
-    assert max_tools_per_turn() == 1
+    assert max_tools_per_turn() >= 100
 
 
 def test_max_tools_explicit(monkeypatch):
@@ -423,8 +455,9 @@ def test_max_tools_zero_means_unlimited(monkeypatch):
 
 
 def test_max_tools_invalid_falls_back(monkeypatch):
+    # Invalid value falls back to the unlimited default, not to 1.
     monkeypatch.setenv("FARCODE_MAX_TOOLS_PER_TURN", "garbage")
-    assert max_tools_per_turn() == 1
+    assert max_tools_per_turn() >= 100
 
 
 # ── undo snapshots ────────────────────────────────────────────────────────────
